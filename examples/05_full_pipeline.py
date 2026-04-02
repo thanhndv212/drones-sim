@@ -10,6 +10,7 @@ This is the key integration example that wires together:
 This closes the loop that was missing in the original codebase.
 """
 
+import os
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -26,6 +27,11 @@ from drones_sim.visualization.viewer import DroneViewer
 
 
 def main():
+    # --- Runtime guards ---
+    # Set CHECK_NIS=1 to enable Normalized Innovation Squared monitoring.
+    # Sustained NIS >> 11.3 (χ²(3,99%)) means the filter is diverging.
+    _CHECK_NIS = os.getenv("CHECK_NIS", "0") == "1"
+
     # --- Setup ---
     quad = QuadcopterDynamics()
     dt = 0.01
@@ -140,6 +146,17 @@ def main():
             )  # σ=0.5m → var=0.25
         est = ekf.get_state()
 
+        # --- NIS check (opt-in: CHECK_NIS=1 env var) ---
+        if _CHECK_NIS:
+            _q   = ekf.x[6:10]
+            _R   = quat_to_rotation_matrix(_q)
+            _res = accel_meas - _R.T @ gravity
+            _H   = ekf._accel_jacobian(_q)
+            _S   = _H @ ekf.P @ _H.T + ekf.R_accel
+            _nis = float(_res @ np.linalg.inv(_S) @ _res)
+            if _nis > 34.0:   # 3× χ²(3,99%) to avoid transient false alarms
+                print(f"[NIS WARNING] t={t[i]:.2f}s  NIS={_nis:.1f} — filter may be diverging")
+
         # --- Control using EKF estimate ---
         est_z = est["position"][2]
         thrust_cmd = z_ctrl.update(target_z, est_z, dt)
@@ -147,9 +164,17 @@ def main():
         # Convert thrust to equal motor speeds
         # Feedforward provides full m*g; PID corrects the residual error around hover.
         # (Old code used quad.g * quad.mass * quad.k_f ≈ 9.81e-6 N — nearly zero!)
-        hover_thrust = quad.g * quad.mass  # 9.81 N
-        total_thrust = thrust_cmd + hover_thrust  # PID output ± feedforward
-        motor_speed = np.sqrt(max(total_thrust / (4 * quad.k_f), 0))
+        hover_thrust = quad.g * quad.mass  # [N]  ≈ 9.81 N for typical quad
+        assert 5.0 < hover_thrust < 50.0, (
+            f"hover_thrust={hover_thrust:.4f} N outside 5–50 N — "
+            "check quad.mass and quad.g units"
+        )
+        total_thrust = thrust_cmd + hover_thrust  # [N]  PID output ± feedforward
+        motor_speed = np.sqrt(max(total_thrust / (4 * quad.k_f), 0))  # [rad/s]
+        assert motor_speed < 10_000.0, (
+            f"motor_speed={motor_speed:.1f} rad/s is physically implausible — "
+            "check k_f units or total_thrust computation"
+        )
         motors = np.full(4, motor_speed)
 
         # --- Debug every 1 s (100 steps) ---
