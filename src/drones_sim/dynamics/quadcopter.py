@@ -19,6 +19,10 @@ class QuadcopterDynamics:
         Motor 2: +y   (right)
         Motor 3: -x   (back)
         Motor 4: -y   (left)
+
+    Motor dynamics: first-order lag  tau_m * d(omega)/dt + omega = omega_cmd.
+    Set motor_time_constant=0.0 (default) for instantaneous motor response.
+    Typical small UAV value: 0.03–0.08 s.
     """
 
     def __init__(
@@ -30,6 +34,7 @@ class QuadcopterDynamics:
         k_m: float = 1.0e-7,
         k_d: float = 0.1,
         g: float = 9.81,
+        motor_time_constant: float = 0.0,
     ):
         self.mass = mass
         self.arm_length = arm_length
@@ -38,12 +43,16 @@ class QuadcopterDynamics:
         self.k_m = k_m
         self.k_d = k_d
         self.g = g
+        self.motor_time_constant = motor_time_constant
 
         # state: [x, y, z, vx, vy, vz, phi, theta, psi, p, q, r]
         self.state = np.zeros(12)
+        # actual motor speeds (lag state); equals commanded speeds when tau_m=0
+        self.motor_states = np.zeros(4)
 
     def reset(self, position: NDArray | None = None, attitude: NDArray | None = None) -> None:
         self.state = np.zeros(12)
+        self.motor_states = np.zeros(4)
         if position is not None:
             self.state[:3] = position
         if attitude is not None:
@@ -101,14 +110,33 @@ class QuadcopterDynamics:
         deriv[9:12] = angular_accel
         return deriv
 
-    def update(self, dt: float, motor_speeds: NDArray) -> NDArray:
-        """Advance one time-step given 4 motor speeds (rad/s) using RK4 integration."""
-        motor_speeds = np.maximum(motor_speeds, 0.0)
+    def get_motor_speeds(self) -> NDArray:
+        """Return actual motor speeds (after lag filter if enabled)."""
+        return self.motor_states.copy()
 
-        k1 = self._derivatives(self.state, motor_speeds)
-        k2 = self._derivatives(self.state + 0.5 * dt * k1, motor_speeds)
-        k3 = self._derivatives(self.state + 0.5 * dt * k2, motor_speeds)
-        k4 = self._derivatives(self.state + dt * k3, motor_speeds)
+    def update(self, dt: float, motor_speeds: NDArray) -> NDArray:
+        """Advance one time-step given 4 commanded motor speeds (rad/s) using RK4.
+
+        When motor_time_constant > 0 the actual rotor speeds follow a first-order
+        lag:  tau_m * d(omega)/dt + omega = omega_cmd.
+        """
+        motor_cmds = np.maximum(motor_speeds, 0.0)
+
+        # --- motor lag integration (discrete first-order filter) ----------
+        if self.motor_time_constant > 0.0:
+            alpha = dt / self.motor_time_constant
+            self.motor_states += alpha * (motor_cmds - self.motor_states)
+            self.motor_states = np.maximum(self.motor_states, 0.0)
+            actual_motors = self.motor_states
+        else:
+            self.motor_states = motor_cmds
+            actual_motors = motor_cmds
+
+        # --- RK4 plant integration ----------------------------------------
+        k1 = self._derivatives(self.state, actual_motors)
+        k2 = self._derivatives(self.state + 0.5 * dt * k1, actual_motors)
+        k3 = self._derivatives(self.state + 0.5 * dt * k2, actual_motors)
+        k4 = self._derivatives(self.state + dt * k3, actual_motors)
 
         self.state += (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
         return self.state.copy()

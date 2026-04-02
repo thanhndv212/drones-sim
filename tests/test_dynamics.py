@@ -38,3 +38,29 @@ def test_hover_thrust():
     for _ in range(100):
         quad.update(0.01, motors)
     assert abs(quad.get_velocity()[2]) < 0.5  # roughly hovering
+
+
+def test_motor_lag_delays_response():
+    """With a motor time constant, actual motor speeds should lag the command."""
+    tau_m = 0.05  # 50 ms
+    dt = 0.01
+    quad = QuadcopterDynamics(motor_time_constant=tau_m)
+    cmd = np.full(4, 1000.0)
+
+    # After one step the actual speed should be less than the command
+    quad.update(dt, cmd)
+    actual = quad.get_motor_speeds()
+    assert np.all(actual < cmd), "Motor speeds should lag behind command"
+    # After enough time (10× tau_m) the lag should have converged to within 1%
+    for _ in range(int(10 * tau_m / dt)):
+        quad.update(dt, cmd)
+    actual_settled = quad.get_motor_speeds()
+    assert np.allclose(actual_settled, cmd, rtol=0.01), "Motor speeds should settle to command"
+
+
+def test_motor_lag_disabled_by_default():
+    """Default motor_time_constant=0 means instant motor response."""
+    quad = QuadcopterDynamics()
+    cmd = np.full(4, 500.0)
+    quad.update(0.01, cmd)
+    assert np.allclose(quad.get_motor_speeds(), cmd)
