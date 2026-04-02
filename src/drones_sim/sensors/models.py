@@ -10,10 +10,27 @@ from numpy.typing import NDArray
 
 @dataclass
 class SensorNoiseModel:
-    """White noise + constant bias model for a 3-axis sensor."""
+    """White noise + bias model for a 3-axis sensor.
+
+    Bias model
+    ----------
+    When ``bias_time_constant`` is finite and ``bias_random_walk_std > 0``,
+    the bias evolves each call to ``apply(dt=...)`` as a discrete
+    first-order Gauss-Markov process:
+
+        b_{k+1} = exp(-dt/tau) * b_k + sigma_b * sqrt(1 - exp(-2dt/tau)) * eta
+
+    where ``tau = bias_time_constant`` and ``sigma_b = bias_random_walk_std``.
+
+    The default ``bias_time_constant=inf`` reproduces the original constant-bias
+    behaviour (backward compatible).  Set ``bias_random_walk_std=0`` to disable
+    the stochastic drive while keeping the exponential decay.
+    """
     noise_std: float
     bias_range: float
     scale_factor_range: tuple[float, float] = (1.0, 1.0)
+    bias_time_constant: float = float('inf')   # tau_b  [s]; inf = constant bias
+    bias_random_walk_std: float = 0.0          # sigma_b [units/s^0.5]
 
     # Populated on init
     bias: NDArray = field(init=False)
@@ -24,8 +41,32 @@ class SensorNoiseModel:
         lo, hi = self.scale_factor_range
         self.scale_factor = np.random.uniform(lo, hi, 3)
 
-    def apply(self, true_value: NDArray, temp_factor: float = 1.0) -> NDArray:
-        """Apply scale factor, bias, and additive noise."""
+    def apply(
+        self,
+        true_value: NDArray,
+        temp_factor: float = 1.0,
+        dt: float | None = None,
+    ) -> NDArray:
+        """Apply scale factor, bias, and additive noise.
+
+        When ``dt`` is provided and bias dynamics are configured the bias
+        state is updated via the Gauss-Markov recursion before measurement
+        corruption.
+        """
+        # Bias update (Gauss-Markov random walk)
+        if (
+            dt is not None
+            and not np.isinf(self.bias_time_constant)
+            and self.bias_time_constant > 0.0
+        ):
+            decay = np.exp(-dt / self.bias_time_constant)
+            if self.bias_random_walk_std > 0.0:
+                noise_amp = self.bias_random_walk_std * np.sqrt(1.0 - decay ** 2)
+                drive = np.random.normal(0.0, noise_amp, 3)
+            else:
+                drive = np.zeros(3)
+            self.bias = decay * self.bias + drive
+
         noisy = true_value * self.scale_factor + self.bias
         noisy += np.random.normal(0, self.noise_std * temp_factor, 3)
         return noisy

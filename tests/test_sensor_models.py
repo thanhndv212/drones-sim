@@ -58,6 +58,74 @@ def test_accel_simulation_includes_dynamics():
     )
 
 
+# ---------------------------------------------------------------------------
+# Gauss-Markov bias random walk tests
+# ---------------------------------------------------------------------------
+
+from drones_sim.sensors.models import SensorNoiseModel
+
+
+def test_bias_constant_when_gauss_markov_disabled():
+    """Default infinite time constant means the bias never changes."""
+    model = SensorNoiseModel(noise_std=0.0, bias_range=0.1)
+    original_bias = model.bias.copy()
+    for _ in range(100):
+        model.apply(np.zeros(3), dt=0.01)
+    np.testing.assert_array_equal(model.bias, original_bias)
+
+
+def test_bias_decays_with_finite_time_constant():
+    """With tau_b < inf and no random-walk drive, bias decays to zero."""
+    initial_bias = np.array([1.0, 1.0, 1.0])
+    model = SensorNoiseModel(
+        noise_std=0.0,
+        bias_range=0.0,
+        bias_time_constant=1.0,    # 1 second
+        bias_random_walk_std=0.0,  # no stochastic drive
+    )
+    model.bias = initial_bias.copy()
+
+    # Integrate for 5 time constants
+    for _ in range(500):
+        model.apply(np.zeros(3), dt=0.01)
+
+    # Bias should have decayed by > 99%
+    assert np.all(np.abs(model.bias) < np.abs(initial_bias) * 0.01), (
+        f"Bias did not decay: {model.bias}"
+    )
+
+
+def test_bias_random_walk_increases_variance():
+    """With stochastic drive, the bias should drift from its initial value."""
+    model = SensorNoiseModel(
+        noise_std=0.0,
+        bias_range=0.0,
+        bias_time_constant=100.0,      # slow decay
+        bias_random_walk_std=0.001,
+    )
+    model.bias = np.zeros(3)
+    initial_bias = model.bias.copy()
+
+    for _ in range(1000):
+        model.apply(np.zeros(3), dt=0.01)
+
+    drift = np.linalg.norm(model.bias - initial_bias)
+    assert drift > 1e-4, f"Bias did not drift: drift={drift:.2e}"
+
+
+def test_apply_without_dt_uses_constant_bias():
+    """Calling apply() without dt should leave bias unchanged (backward compat)."""
+    model = SensorNoiseModel(
+        noise_std=0.0,
+        bias_range=0.1,
+        bias_time_constant=0.1,
+        bias_random_walk_std=0.01,
+    )
+    original_bias = model.bias.copy()
+    model.apply(np.zeros(3))  # no dt keyword
+    np.testing.assert_array_equal(model.bias, original_bias)
+
+
 def test_specific_force_sign_convention():
     """Specific force must point *away from* the ground at hover.
 

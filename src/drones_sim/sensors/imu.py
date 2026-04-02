@@ -124,9 +124,9 @@ class IMUSimulator:
                 true_gyro = true_gyro + self.temp_model.gyro_offset(temp)
                 true_mag = true_mag + self.temp_model.mag_offset(temp)
 
-            accel_out[i] = self.accel_model.apply(true_accel, temp_factor)
-            gyro_out[i] = self.gyro_model.apply(true_gyro, temp_factor)
-            mag_out[i] = self.mag_model.apply(true_mag, temp_factor)
+            accel_out[i] = self.accel_model.apply(true_accel, temp_factor, dt)
+            gyro_out[i] = self.gyro_model.apply(true_gyro, temp_factor, dt)
+            mag_out[i] = self.mag_model.apply(true_mag, temp_factor, dt)
 
         return IMUData(
             t=traj.t,
