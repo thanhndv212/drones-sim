@@ -69,10 +69,8 @@ class QuadcopterDynamics:
         phi, theta, psi = self.state[6:9]
         return euler_to_rotation_matrix(phi, theta, psi)
 
-    def update(self, dt: float, motor_speeds: NDArray) -> NDArray:
-        """Advance one time-step given 4 motor speeds (rad/s)."""
-        motor_speeds = np.maximum(motor_speeds, 0.0)
-
+    def _derivatives(self, state: NDArray, motor_speeds: NDArray) -> NDArray:
+        """Compute state derivatives for a given state and motor speeds."""
         T = self.k_f * np.sum(motor_speeds**2)
         tau_phi = self.k_f * self.arm_length * (motor_speeds[1] ** 2 - motor_speeds[3] ** 2)
         tau_theta = self.k_f * self.arm_length * (motor_speeds[2] ** 2 - motor_speeds[0] ** 2)
@@ -82,9 +80,11 @@ class QuadcopterDynamics:
         )
         torques = np.array([tau_phi, tau_theta, tau_psi])
 
-        x, y, z, vx, vy, vz, phi, theta, psi, p, q, r = self.state
-        R = self.rotation_matrix()
+        vx, vy, vz = state[3:6]
+        phi, theta, psi = state[6:9]
+        p, q, r = state[9:12]
 
+        R = euler_to_rotation_matrix(phi, theta, psi)
         F_thrust = R @ np.array([0, 0, T])
         F_drag = -self.k_d * np.array([vx, vy, vz])
         F_gravity = np.array([0, 0, -self.mass * self.g])
@@ -92,7 +92,6 @@ class QuadcopterDynamics:
 
         omega = np.array([p, q, r])
         angular_accel = np.linalg.solve(self.I, torques - np.cross(omega, self.I @ omega))
-
         euler_rates = angular_vel_to_euler_rates(phi, theta, omega)
 
         deriv = np.zeros(12)
@@ -100,8 +99,18 @@ class QuadcopterDynamics:
         deriv[3:6] = accel
         deriv[6:9] = euler_rates
         deriv[9:12] = angular_accel
+        return deriv
 
-        self.state += deriv * dt
+    def update(self, dt: float, motor_speeds: NDArray) -> NDArray:
+        """Advance one time-step given 4 motor speeds (rad/s) using RK4 integration."""
+        motor_speeds = np.maximum(motor_speeds, 0.0)
+
+        k1 = self._derivatives(self.state, motor_speeds)
+        k2 = self._derivatives(self.state + 0.5 * dt * k1, motor_speeds)
+        k3 = self._derivatives(self.state + 0.5 * dt * k2, motor_speeds)
+        k4 = self._derivatives(self.state + dt * k3, motor_speeds)
+
+        self.state += (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
         return self.state.copy()
 
     # -- motor allocation helpers ------------------------------------------

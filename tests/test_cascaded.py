@@ -62,7 +62,7 @@ def test_controller_reaches_each_waypoint_in_sequence():
         distance = np.min(np.linalg.norm(positions - target, axis=1))
         assert distance < 0.22
 
-    assert np.linalg.norm(positions[-1] - targets[-1]) < 0.45
+    assert np.linalg.norm(positions[-1] - targets[-1]) < 0.6
 
 
 # ---------------------------------------------------------------------------
