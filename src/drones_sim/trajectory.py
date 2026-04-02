@@ -7,10 +7,13 @@ acceleration, and (N, 4) for quaternion orientation [w,x,y,z].
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from math import factorial
 from typing import Literal
 
 import numpy as np
 from numpy.typing import NDArray
+from numpy.polynomial.polynomial import polyval as polyval1d, polyder
+from scipy.linalg import lstsq
 from scipy.spatial.transform import Rotation as R
 
 from .math_utils import quat_from_euler
@@ -212,6 +215,174 @@ def generate_waypoint_trajectory(
 
     return TrajectoryData(
         t=t,
+        position=position,
+        velocity=velocity,
+        acceleration=acceleration,
+        orientation_quat=orientation_quat,
+        angular_velocity=angular_velocity,
+    )
+
+
+def generate_minimum_snap(
+    waypoints: list[tuple[float, float, float]],
+    times: list[float] | None = None,
+    order: int = 7,
+    dt: float = 0.01,
+) -> TrajectoryData:
+    """Generate a C^3-continuous minimum-snap polynomial trajectory.
+
+    Fits piecewise polynomials of ``order`` through ``waypoints``, minimising
+    the integral of squared snap (4th time-derivative of position).
+
+    Constraints enforced:
+
+    * Position equality at each waypoint.
+    * Zero velocity, acceleration, and jerk at the first and the last waypoint.
+    * C^3 continuity (velocity, acceleration, jerk) at every interior junction.
+
+    The resulting QP is solved via the KKT bordered system using
+    ``scipy.linalg.lstsq``.
+
+    Parameters
+    ----------
+    waypoints:
+        List of (x, y, z) positions.  Requires at least 2 points.
+    times:
+        Absolute time-stamps [s] for each waypoint (length = len(waypoints)).
+        If ``None``, segment durations are allocated proportionally to
+        Euclidean inter-waypoint distances (minimum 0.1 s per segment).
+    order:
+        Polynomial degree per segment.  Must be >= 7 for minimum-snap.
+    dt:
+        Sampling period [s] for the returned ``TrajectoryData``.
+
+    Returns
+    -------
+    TrajectoryData
+        Consistent position, velocity, and acceleration arrays.
+        Orientation is the identity quaternion (yaw tracking not computed).
+    """
+    order = max(order, 7)          # minimum degree for 4 BCs per side
+    n   = order + 1                # coefficients per segment
+    snap = 4                       # derivative order being minimised
+
+    wp = np.array(waypoints, dtype=float)  # (M+1, 3)
+    M  = len(wp) - 1
+    if M < 1:
+        raise ValueError("At least 2 waypoints are required.")
+
+    # ------------------------------------------------------------------ #
+    # Time allocation
+    # ------------------------------------------------------------------ #
+    if times is None:
+        dists = np.linalg.norm(np.diff(wp, axis=0), axis=1)
+        total = float(np.sum(dists))
+        seg_T = (dists / total * float(M)) if total > 1e-9 else np.ones(M)
+        seg_T = np.maximum(seg_T, 0.1)
+        t_arr = np.concatenate([[0.0], np.cumsum(seg_T)])
+    else:
+        t_arr = np.array(times, dtype=float)
+        if len(t_arr) != M + 1:
+            raise ValueError("len(times) must equal len(waypoints).")
+        seg_T = np.diff(t_arr)
+
+    T = seg_T            # durations, shape (M,)
+    N = M * n            # total unknowns per axis
+
+    # ------------------------------------------------------------------ #
+    # Block-diagonal snap cost matrix Q  (N x N)
+    # ------------------------------------------------------------------ #
+    Q_full = np.zeros((N, N))
+    for k in range(M):
+        Tk = T[k]
+        for i in range(snap, n):
+            for j in range(snap, n):
+                r = i + j - 2 * snap + 1
+                Q_full[k*n + i, k*n + j] = (
+                    factorial(i) // factorial(i - snap) *
+                    factorial(j) // factorial(j - snap) *
+                    Tk**r / r
+                )
+
+    # ------------------------------------------------------------------ #
+    # Constraint matrix A (same for all axes; only b changes per axis)
+    # ------------------------------------------------------------------ #
+    def poly_row(k: int, tau: float, deriv: int) -> NDArray:
+        """Global row vector for p_k^(deriv)(tau)."""
+        row = np.zeros(N)
+        for j in range(deriv, n):
+            row[k * n + j] = factorial(j) / factorial(j - deriv) * tau ** (j - deriv)
+        return row
+
+    con_rows: list[NDArray] = []
+    # 1. Start position of each segment
+    for k in range(M):
+        con_rows.append(poly_row(k, 0.0, 0))
+    # 2. End position of each segment
+    for k in range(M):
+        con_rows.append(poly_row(k, T[k], 0))
+    # 3. Zero vel/acc/jerk at trajectory start
+    for deriv in range(1, snap):
+        con_rows.append(poly_row(0, 0.0, deriv))
+    # 4. Zero vel/acc/jerk at trajectory end
+    for deriv in range(1, snap):
+        con_rows.append(poly_row(M - 1, T[M - 1], deriv))
+    # 5. C^3 continuity at interior junctions (vel, acc, jerk)
+    for k in range(M - 1):
+        for deriv in range(1, snap):
+            con_rows.append(poly_row(k, T[k], deriv) - poly_row(k + 1, 0.0, deriv))
+
+    A = np.array(con_rows)         # (n_con, N)
+    n_con = A.shape[0]
+
+    # ------------------------------------------------------------------ #
+    # KKT bordered system  min c'Qc s.t. Ac = b
+    # ------------------------------------------------------------------ #
+    KKT = np.block([
+        [Q_full,                     A.T                      ],
+        [A,                          np.zeros((n_con, n_con)) ],
+    ])
+
+    coeffs = np.zeros((M, n, 3))   # [segment, coeff_idx, axis]
+    for d in range(3):
+        b = np.zeros(n_con)
+        for k in range(M):
+            b[k]     = wp[k,     d]   # start of segment k
+            b[M + k] = wp[k + 1, d]   # end   of segment k
+        # All other entries are 0 (zero BCs and continuity)
+
+        rhs = np.zeros(N + n_con)
+        rhs[N:] = b
+        sol, *_ = lstsq(KKT, rhs, check_finite=False)
+        coeffs[:, :, d] = sol[:N].reshape(M, n)
+
+    # ------------------------------------------------------------------ #
+    # Sample trajectory
+    # ------------------------------------------------------------------ #
+    t_total = float(t_arr[-1])
+    t_out   = np.arange(0.0, t_total, dt)
+    nn      = len(t_out)
+    position     = np.zeros((nn, 3))
+    velocity     = np.zeros((nn, 3))
+    acceleration = np.zeros((nn, 3))
+
+    for k in range(M):
+        t_lo = t_arr[k]
+        t_hi = t_arr[k + 1] if k < M - 1 else t_arr[-1] + dt
+        mask = (t_out >= t_lo) & (t_out < t_hi)
+        tau  = t_out[mask] - t_lo
+        for d in range(3):
+            c = coeffs[k, :, d]
+            position[mask, d]     = polyval1d(tau, c)
+            velocity[mask, d]     = polyval1d(tau, polyder(c, 1))
+            acceleration[mask, d] = polyval1d(tau, polyder(c, 2))
+
+    orientation_quat = np.zeros((nn, 4))
+    orientation_quat[:, 0] = 1.0          # identity
+    angular_velocity = np.zeros((nn, 3))
+
+    return TrajectoryData(
+        t=t_out,
         position=position,
         velocity=velocity,
         acceleration=acceleration,
