@@ -45,11 +45,11 @@ class DroneViewer:
         name: str = "trajectory",
         color: tuple[int, int, int] = (0, 120, 255),
         line_width: float = 2.0,
-    ) -> None:
-        """Add a 3D line for a trajectory."""
+    ) -> object:
+        """Add a 3D line for a trajectory. Returns the scene node handle."""
         points = positions.astype(np.float32)
         colors = np.tile(np.array(color, dtype=np.uint8), (len(points), 1))
-        self.server.scene.add_point_cloud(
+        return self.server.scene.add_point_cloud(
             f"/{name}",
             points=points,
             colors=colors,
@@ -169,14 +169,21 @@ class DroneViewer:
         """
         # Add static elements
         self.add_trajectory(positions, "true_traj", color=(0, 120, 255))
+        filtered_handle = None
         if filtered_positions is not None:
-            self.add_trajectory(
+            filtered_handle = self.add_trajectory(
                 filtered_positions,
                 "filtered_traj",
                 color=(255, 80, 0),
             )
         if waypoints is not None:
             self.add_waypoints(waypoints)
+        if reference_positions is not None:
+            self.add_trajectory(
+                reference_positions,
+                "ref_traj",
+                color=(50, 220, 80),
+            )
 
         frame_name = self.add_quadcopter_frame()
 
@@ -271,6 +278,15 @@ class DroneViewer:
         playing = [False]
         play_btn = self.server.gui.add_button("▶  Play")
         reset_btn = self.server.gui.add_button("⟳  Reset")
+        # EKF estimate toggle (only shown when filtered_positions provided)
+        if filtered_handle is not None:
+            ekf_chk = self.server.gui.add_checkbox(
+                "Show EKF estimate", initial_value=True
+            )
+
+            @ekf_chk.on_update
+            def _on_ekf_toggle(event: viser.GuiEvent) -> None:
+                filtered_handle.visible = ekf_chk.value
 
         @play_btn.on_click
         def _on_play(event: viser.GuiEvent) -> None:
