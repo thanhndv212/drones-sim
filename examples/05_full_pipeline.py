@@ -22,6 +22,7 @@ from drones_sim.math_utils import (
     quat_from_euler,
     quat_to_rotation_matrix,
 )
+from drones_sim.visualization.viewer import DroneViewer
 
 
 def main():
@@ -55,6 +56,8 @@ def main():
     true_att = np.zeros((n, 3))
     est_quat = np.zeros((n, 4))
     motor_log = np.zeros((n, 4))
+    rotations = np.zeros((n, 3, 3))
+    targets_log = np.zeros((n, 3))
 
     quad.reset()
 
@@ -100,6 +103,8 @@ def main():
         true_att[i] = att
         est_quat[i] = est["quaternion"]
         motor_log[i] = motors
+        rotations[i] = R_true
+        targets_log[i] = [0.0, 0.0, target_z]
 
     # --- Plot ---
     fig, axes = plt.subplots(2, 2, figsize=(12, 8))
@@ -139,6 +144,16 @@ def main():
 
     print(f"Final height: {true_pos[-1, 2]:.3f}m (target: {target_z}m)")
     print(f"Mean estimation error: {np.linalg.norm(true_pos - est_pos, axis=1).mean():.4f}m")
+
+    # --- 3D Viewer ---
+    viewer = DroneViewer(port=8080)
+    viewer.playback(
+        t,
+        true_pos,
+        rotations,
+        filtered_positions=est_pos,
+        reference_positions=targets_log,
+    )
 
 
 if __name__ == "__main__":
