@@ -2,6 +2,9 @@
 
 Quadcopter dynamics simulation with cascaded PID control and EKF sensor fusion.
 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/thanhndv212/drones-sim)
+
+
 ## Install
 
 ```bash
