@@ -156,8 +156,14 @@ class DroneViewer:
         rotation_matrices: NDArray | None = None,
         filtered_positions: NDArray | None = None,
         waypoints: list[tuple[float, float, float]] | None = None,
+        reference_positions: NDArray | None = None,
     ) -> None:
         """Launch interactive playback with a time slider in the GUI.
+
+        Args:
+            reference_positions: If provided, a (N, 3) array of desired positions.
+                A live tracking-error plot (‖actual − reference‖) is shown in
+                the GUI panel and updates with every frame.
 
         This blocks and serves the viewer until the user stops it.
         """
@@ -174,6 +180,80 @@ class DroneViewer:
 
         frame_name = self.add_quadcopter_frame()
 
+        # Simulation time step (seconds per frame) — base value derived from data
+        _dt_base = float(t[1] - t[0]) if len(t) > 1 else 0.05
+
+        # --- Tracking-error plot (optional) ---
+        _error_img = None
+        _errors: NDArray | None = None
+        _render_error_plot = None
+
+        if reference_positions is not None:
+            _errors = np.linalg.norm(positions - reference_positions, axis=1)
+            import io
+            import matplotlib.figure
+            import matplotlib.backends.backend_agg as _agg
+
+            def _render_error_plot(idx: int) -> NDArray:
+                fig = matplotlib.figure.Figure(figsize=(4, 1.9))
+                _agg.FigureCanvasAgg(fig)
+                ax = fig.add_subplot(111)
+                # Full trace in grey
+                ax.plot(t, _errors, color="#888888", linewidth=0.7, alpha=0.5)
+                # Elapsed trace in orange
+                if idx > 0:
+                    ax.plot(
+                        t[: idx + 1],
+                        _errors[: idx + 1],
+                        color="#ff8c00",
+                        linewidth=1.6,
+                    )
+                # Current-time cursor
+                ax.axvline(
+                    t[idx], color="#dd2222", linewidth=1.0, linestyle="--"
+                )
+                ax.set_xlim(t[0], t[-1])
+                ax.set_ylim(
+                    bottom=0, top=max(float(_errors.max()) * 1.15, 0.02)
+                )
+                ax.set_xlabel("t  (s)", fontsize=7)
+                ax.set_ylabel("‖e‖  m", fontsize=7)
+                ax.set_title(
+                    f"Tracking Error  —  now: {_errors[idx]:.3f} m",
+                    fontsize=8,
+                    fontweight="bold",
+                )
+                ax.tick_params(labelsize=6)
+                ax.grid(True, alpha=0.25, linewidth=0.5)
+                fig.tight_layout(pad=0.4)
+                buf = io.BytesIO()
+                fig.savefig(buf, format="png", dpi=90)
+                buf.seek(0)
+                import PIL.Image
+
+                return np.array(PIL.Image.open(buf).convert("RGB"))
+
+            _error_img = self.server.gui.add_image(_render_error_plot(0))
+
+        # Wall-clock time of the last error-plot redraw (throttled to ≤10 fps)
+        import time as _time
+        _plot_last_draw: list[float] = [0.0]
+        _PLOT_MIN_INTERVAL = 0.1  # seconds
+
+        def _set_frame(idx: int) -> None:
+            pos = positions[idx]
+            R = (
+                rotation_matrices[idx]
+                if rotation_matrices is not None
+                else np.eye(3)
+            )
+            self.update_quadcopter_pose(frame_name, pos, R)
+            if _error_img is not None:
+                now = _time.monotonic()
+                if now - _plot_last_draw[0] >= _PLOT_MIN_INTERVAL:
+                    _error_img.image = _render_error_plot(idx)
+                    _plot_last_draw[0] = now
+
         # Time slider
         slider = self.server.gui.add_slider(
             "Time step",
@@ -185,20 +265,35 @@ class DroneViewer:
 
         @slider.on_update
         def _on_slider(event: viser.GuiEvent) -> None:
-            idx = int(slider.value)
-            pos = positions[idx]
-            if rotation_matrices is not None:
-                R = rotation_matrices[idx]
-            else:
-                R = np.eye(3)
-            self.update_quadcopter_pose(frame_name, pos, R)
+            _set_frame(int(slider.value))
+
+        # Playback controls
+        playing = [False]
+        play_btn = self.server.gui.add_button("▶  Play")
+        reset_btn = self.server.gui.add_button("⟳  Reset")
+
+        @play_btn.on_click
+        def _on_play(event: viser.GuiEvent) -> None:
+            playing[0] = not playing[0]
+            play_btn.label = "⏸  Pause" if playing[0] else "▶  Play"
+
+        speed_input = self.server.gui.add_number(
+            "Speed ×",
+            initial_value=1.0,
+            min=0.1,
+            max=100.0,
+            step=0.1,
+        )
+
+        @reset_btn.on_click
+        def _on_reset(event: viser.GuiEvent) -> None:
+            playing[0] = False
+            play_btn.label = "▶  Play"
+            slider.value = 0
+            _set_frame(0)
 
         # Initial pose
-        if rotation_matrices is not None:
-            R0 = rotation_matrices[0]
-        else:
-            R0 = np.eye(3)
-        self.update_quadcopter_pose(frame_name, positions[0], R0)
+        _set_frame(0)
 
         if hasattr(self.server, "get_port"):
             port = self.server.get_port()
@@ -210,7 +305,18 @@ class DroneViewer:
         )
         try:
             while True:
-                import time
-                time.sleep(1.0)
+                if playing[0]:
+                    next_idx = int(slider.value) + 1
+                    if next_idx >= len(t):
+                        # Reached end — stop playback
+                        playing[0] = False
+                        play_btn.label = "▶  Play"
+                        _time.sleep(0.05)
+                    else:
+                        slider.value = next_idx
+                        _set_frame(next_idx)
+                        _time.sleep(_dt_base / float(speed_input.value))
+                else:
+                    _time.sleep(0.05)
         except KeyboardInterrupt:
             pass

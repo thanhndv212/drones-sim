@@ -37,6 +37,7 @@ def main():
 
     positions = np.zeros((n, 3))
     rotations = np.zeros((n, 3, 3))
+    targets_log = np.zeros((n, 3))
 
     quad.reset()
     ctrl.reset()
@@ -56,11 +57,18 @@ def main():
         positions[i] = quad.get_position()
         phi, theta, psi = quad.get_attitude()
         rotations[i] = euler_to_rotation_matrix(phi, theta, psi)
+        targets_log[i] = target
         prev_target = target.copy()
 
     # Launch viewer
     viewer = DroneViewer(port=8080)
-    viewer.playback(t, positions, rotations, waypoints=waypoints)
+    viewer.playback(
+        t,
+        positions,
+        rotations,
+        waypoints=waypoints,
+        reference_positions=targets_log,
+    )
 
 
 if __name__ == "__main__":
