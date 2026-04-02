@@ -32,10 +32,26 @@ from .ahrs import AHRS
 # ---------------------------------------------------------------------------
 
 class ExtendedKalmanFilter:
-    """10-state EKF: [pos(3), vel(3), quat(4)].
+    """10-state EKF for quadcopter navigation.
 
-    Uses analytically-derived Jacobians for accelerometer and magnetometer
-    measurement models.
+    State vector x[10]::
+
+        x[0:3]   position      [m]      ENU world frame (z-up)
+        x[3:6]   velocity      [m/s]    ENU world frame
+        x[6:10]  quaternion    [-]      Hamilton [w, x, y, z], body→world
+
+    Gravity convention (ENU, z-up)::
+
+        self.gravity = [0, 0, 9.81]   # upward reaction direction
+
+        At rest  : IMU reads  Rᵀ @ [0,0,9.81]  in body frame  (positive body-z)
+        Velocity : a_world = R @ f_body - self.gravity
+        Correct  : expected  = Rᵀ @ self.gravity   (NOT -Rᵀ @ g)
+
+    Key identity used throughout::
+
+        f_body = Rᵀ (a_linear + g_up)   # specific force = what IMU measures
+        a_linear = R @ f_body - g_up     # recover linear accel for integration
     """
 
     def __init__(
@@ -140,6 +156,10 @@ class ExtendedKalmanFilter:
 
         self.x += K @ residual
         self.x[6:10] = quat_normalize(self.x[6:10])
+        assert abs(np.linalg.norm(self.x[6:10]) - 1.0) < 1e-3, (
+            f"EKF quaternion norm={np.linalg.norm(self.x[6:10]):.6f} after correct_accel "
+            "\u2014 filter diverging"
+        )
         self.P = (np.eye(self.n) - K @ H) @ self.P
 
     # -- magnetometer correction -------------------------------------------
@@ -156,6 +176,10 @@ class ExtendedKalmanFilter:
 
         self.x += K @ residual
         self.x[6:10] = quat_normalize(self.x[6:10])
+        assert abs(np.linalg.norm(self.x[6:10]) - 1.0) < 1e-3, (
+            f"EKF quaternion norm={np.linalg.norm(self.x[6:10]):.6f} after correct_mag "
+            "\u2014 filter diverging"
+        )
         self.P = (np.eye(self.n) - K @ H) @ self.P
 
     # -- GPS / barometer position correction -------------------------------
@@ -199,56 +223,82 @@ class ExtendedKalmanFilter:
     # -- Jacobians (analytical) --------------------------------------------
 
     def _accel_jacobian(self, q: NDArray) -> NDArray:
-        """Analytical Jacobian d(R^T @ g)/dq for the accelerometer measurement model.
+        """Analytical Jacobian d(R(q/|q|)^T @ g)/dq for the accelerometer measurement model.
 
-        Derived from the Hamilton quaternion rotation matrix:
-          R[w,x,y,z] (body→world), so R^T maps world→body.
+        Derived from the Hamilton quaternion rotation matrix::
+
+            R[w,x,y,z] (body→world), so R^T maps world→body.
+
+        Because quat_to_rotation_matrix() normalizes q internally, the true
+        Jacobian w.r.t. the raw quaternion parameters is the tangent-space
+        projection of the algebraic derivative::
+
+            H_proj[:, 6:10] = H_raw[:, 6:10] - outer(H_raw[:, 6:10] @ q, q)
+
+        This removes the radial (along-q) component that normalization kills.
         State layout: indices 6-9 = [qw, qx, qy, qz].
         """
         w, x, y, z = q
         gx, gy, gz = self.gravity
         H = np.zeros((3, self.n))
 
-        # Row 0:  d(R^T @ g)[0] / d[w, x, y, z]
-        H[0, 6] = 2 * z * gy - 2 * y * gz
-        H[0, 7] = 2 * y * gy + 2 * z * gz
+        # Row 0:  d(R^T @ g)[0] / d[w, x, y, z]  (unnormalized)
+        H[0, 6] =  2 * z * gy - 2 * y * gz
+        H[0, 7] =  2 * y * gy + 2 * z * gz
         H[0, 8] = -4 * y * gx + 2 * x * gy - 2 * w * gz
         H[0, 9] = -4 * z * gx + 2 * w * gy + 2 * x * gz
 
         # Row 1:  d(R^T @ g)[1] / d[w, x, y, z]
         H[1, 6] = -2 * z * gx + 2 * x * gz
-        H[1, 7] = 2 * y * gx - 4 * x * gy + 2 * w * gz
-        H[1, 8] = 2 * x * gx + 2 * z * gz
+        H[1, 7] =  2 * y * gx - 4 * x * gy + 2 * w * gz
+        H[1, 8] =  2 * x * gx + 2 * z * gz
         H[1, 9] = -2 * w * gx - 4 * z * gy + 2 * y * gz
 
         # Row 2:  d(R^T @ g)[2] / d[w, x, y, z]
-        H[2, 6] = 2 * y * gx - 2 * x * gy
-        H[2, 7] = 2 * z * gx - 2 * w * gy - 4 * x * gz
-        H[2, 8] = 2 * w * gx + 2 * z * gy - 4 * y * gz
-        H[2, 9] = 2 * x * gx + 2 * y * gy
+        H[2, 6] =  2 * y * gx - 2 * x * gy
+        H[2, 7] =  2 * z * gx - 2 * w * gy - 4 * x * gz
+        H[2, 8] =  2 * w * gx + 2 * z * gy - 4 * y * gz
+        H[2, 9] =  2 * x * gx + 2 * y * gy
+
+        # Tangent-space projection: remove the component along q (radial direction)
+        # so the Jacobian matches d(R(q/|q|)^T g)/dq as computed by the EKF.
+        Hq = H[:, 6:10]           # (3, 4)
+        H[:, 6:10] = Hq - np.outer(Hq @ q, q)
 
         return H
 
     def _mag_jacobian(self, q: NDArray) -> NDArray:
-        """d(R^T m)/d(quat) — analytical Jacobian of magnetometer measurement model."""
+        """d(R(q/|q|)^T m)/dq — analytical Jacobian of magnetometer measurement model.
+
+        Identical structure to _accel_jacobian: both compute d(R^T v)/dq for a
+        constant reference vector v (gravity vs. mag_ref).
+        Includes tangent-space projection (see _accel_jacobian docstring).
+        """
         w, x, y, z = q
         mx, my, mz = self.mag_ref
         H = np.zeros((3, self.n))
 
-        H[0, 6] = 2 * (2 * w * mz - 2 * my * y + 2 * mx * z)
-        H[0, 7] = 2 * (2 * mz * w - 2 * my * z)
-        H[0, 8] = 2 * (-2 * mx * z - 2 * mz * x)
-        H[0, 9] = 2 * (2 * mx * y - 2 * my * x)
+        # Row 0: d(R^T m)[0] / d[w, x, y, z]
+        H[0, 6] =  2 * z * my - 2 * y * mz
+        H[0, 7] =  2 * y * my + 2 * z * mz
+        H[0, 8] = -4 * y * mx + 2 * x * my - 2 * w * mz
+        H[0, 9] = -4 * z * mx + 2 * w * my + 2 * x * mz
 
-        H[1, 6] = 2 * (2 * mz * y - 2 * mx * z)
-        H[1, 7] = 2 * (2 * my * w + 2 * mz * z)
-        H[1, 8] = 2 * (2 * w * mz - 2 * mx * y)
-        H[1, 9] = 2 * (2 * mz * x + 2 * my * w)
+        # Row 1: d(R^T m)[1] / d[w, x, y, z]
+        H[1, 6] = -2 * z * mx + 2 * x * mz
+        H[1, 7] =  2 * y * mx - 4 * x * my + 2 * w * mz
+        H[1, 8] =  2 * x * mx + 2 * z * mz
+        H[1, 9] = -2 * w * mx - 4 * z * my + 2 * y * mz
 
-        H[2, 6] = 2 * (-2 * my * w - 2 * mx * x)
-        H[2, 7] = 2 * (-2 * mx * w - 2 * my * x)
-        H[2, 8] = 2 * (-2 * my * y - 2 * mz * z)
-        H[2, 9] = 2 * (2 * mx * w - 2 * my * z)
+        # Row 2: d(R^T m)[2] / d[w, x, y, z]
+        H[2, 6] =  2 * y * mx - 2 * x * my
+        H[2, 7] =  2 * z * mx - 2 * w * my - 4 * x * mz
+        H[2, 8] =  2 * w * mx + 2 * z * my - 4 * y * mz
+        H[2, 9] =  2 * x * mx + 2 * y * my
+
+        # Tangent-space projection
+        Hq = H[:, 6:10]
+        H[:, 6:10] = Hq - np.outer(Hq @ q, q)
 
         return H
 
