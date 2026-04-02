@@ -16,6 +16,7 @@ and concrete pointers to source files.
 | 4 | [Planning](planning.md) | Trajectory generators, differential flatness, minimum-snap, RRT* |
 | 5 | [Control](control.md) | Cascade PID, gain table, LQR/MPC/SMC/geometric SE(3) families |
 | 6 | [Simulation](simulation.md) | Full closed-loop pipeline, visualization, metrics, planned extensions |
+| 7 | [Testing](testing.md) | Validation strategy, Jacobian tests, regression gates, implementation roadmap |
 
 ## Module Map
 
