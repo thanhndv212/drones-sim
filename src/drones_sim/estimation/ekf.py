@@ -32,13 +32,15 @@ from .ahrs import AHRS
 # ---------------------------------------------------------------------------
 
 class ExtendedKalmanFilter:
-    """10-state EKF for quadcopter navigation.
+    """16-state EKF for quadcopter navigation.
 
-    State vector x[10]::
+    State vector x[16]::
 
         x[0:3]   position      [m]      ENU world frame (z-up)
         x[3:6]   velocity      [m/s]    ENU world frame
         x[6:10]  quaternion    [-]      Hamilton [w, x, y, z], body→world
+        x[10:13] accel_bias    [m/s²]   body-frame accelerometer bias (random walk)
+        x[13:16] gyro_bias     [rad/s]  body-frame gyroscope bias (random walk)
 
     Gravity convention (ENU, z-up)::
 
@@ -52,6 +54,14 @@ class ExtendedKalmanFilter:
 
         f_body = Rᵀ (a_linear + g_up)   # specific force = what IMU measures
         a_linear = R @ f_body - g_up     # recover linear accel for integration
+
+    Backward compatibility:
+        ``initial_state`` may be a 10-element vector (legacy).  It is padded
+        with zeros for the six bias states automatically.
+
+    Covariance updates use the Joseph form
+        ``P = (I-KH) P (I-KH)ᵀ + K R Kᵀ``
+    for numerical stability (avoids asymmetric drift in P).
     """
 
     def __init__(
@@ -61,11 +71,17 @@ class ExtendedKalmanFilter:
         gravity: NDArray | None = None,
         mag_ref: NDArray | None = None,
     ):
-        self.n = 10
+        self.n = 16
         self.dt = dt
 
+        # Accept legacy 10-element initial_state and pad with zero biases.
         if initial_state is not None:
-            self.x = initial_state.copy()
+            if len(initial_state) == 10:
+                s = np.zeros(16)
+                s[:10] = initial_state
+                self.x = s
+            else:
+                self.x = initial_state.copy()
         else:
             self.x = np.zeros(self.n)
             self.x[6] = 1.0  # identity quaternion
@@ -78,21 +94,21 @@ class ExtendedKalmanFilter:
         self.P[0:3, 0:3] *= 0.01
         self.P[3:6, 3:6] *= 0.1
         self.P[6:10, 6:10] *= 0.001
+        self.P[10:13, 10:13] = np.eye(3) * 0.01    # accel bias init uncertainty
+        self.P[13:16, 13:16] = np.eye(3) * 0.0001  # gyro  bias init uncertainty
 
-        # Process noise
-        self.Q = np.eye(self.n) * 0.001
-        self.Q[0:3, 0:3] *= 0.001
-        self.Q[3:6, 3:6] *= 0.01
-        self.Q[6:10, 6:10] *= 0.001
+        # Process noise — diagonal, tuned to sensor noise spectral densities.
+        # Bias states model slow random walks; their Q entries are tiny.
+        self.Q = np.zeros((self.n, self.n))
+        self.Q[0:3, 0:3]   = np.eye(3) * 1e-6    # position (driven by velocity)
+        self.Q[3:6, 3:6]   = np.eye(3) * 0.01    # velocity  (accel noise ×dt)
+        self.Q[6:10, 6:10] = np.eye(4) * 0.002   # quaternion (gyro noise ×dt)
+        self.Q[10:13, 10:13] = np.eye(3) * 2.5e-5  # accel bias random walk
+        self.Q[13:16, 13:16] = np.eye(3) * 1e-7    # gyro  bias random walk
 
         # Measurement noise
-        self.R_accel = np.eye(3) * 0.05
-        self.R_mag = np.eye(3) * 0.5
-
-        # Bias estimates (slowly updated)
-        self.accel_bias = np.zeros(3)
-        self.gyro_bias = np.zeros(3)
-        self.mag_bias = np.zeros(3)
+        self.R_accel = np.eye(3) * 0.003   # σ≈0.05 m/s² → var≈0.0025
+        self.R_mag   = np.eye(3) * 0.5
 
     # -- prediction --------------------------------------------------------
 
@@ -102,35 +118,69 @@ class ExtendedKalmanFilter:
         Args:
             gyro:  Body-frame angular velocity (rad/s), 3-vector.
             accel: Body-frame specific force (m/s²), 3-vector.
-                   When provided, linear acceleration is integrated into velocity.
-                   This is the IMU pre-integration path and is the primary way the
-                   EKF tracks translational motion without GPS.
-                   If None the velocity state is held constant (attitude-only mode).
+                   When provided, linear acceleration is integrated into velocity
+                   and position (midpoint scheme: pos += v*dt + ½*a*dt²).
+                   If None the velocity/position states are held constant.
         """
-        pos, vel, quat = self.x[:3], self.x[3:6], self.x[6:10]
-        gyro_c = gyro - self.gyro_bias
+        pos  = self.x[:3]
+        vel  = self.x[3:6]
+        quat = self.x[6:10]
+        accel_bias = self.x[10:13]
+        gyro_bias  = self.x[13:16]
 
-        q_dot = quat_derivative(quat, gyro_c)
+        # Bias-corrected measurements
+        gyro_c  = gyro - gyro_bias
+        accel_c = (accel - accel_bias) if accel is not None else None
+
+        # Quaternion kinematics
+        q_dot    = quat_derivative(quat, gyro_c)
         new_quat = quat_normalize(quat + q_dot * self.dt)
 
-        # Velocity propagation from IMU specific force
-        if accel is not None:
+        # Velocity + position propagation from specific force
+        if accel_c is not None:
             R = quat_to_rotation_matrix(quat)
-            # specific force in world frame, minus gravity = linear accel
-            a_world = R @ (accel - self.accel_bias) - self.gravity
+            a_world = R @ accel_c - self.gravity   # linear acceleration in world
             new_vel = vel + a_world * self.dt
+            # Midpoint scheme: pos += v*dt + ½*a*dt²
+            new_pos = pos + vel * self.dt + 0.5 * a_world * self.dt ** 2
         else:
             new_vel = vel
+            new_pos = pos + vel * self.dt
 
-        self.x[:3] = (
-            pos + vel * self.dt
-        )  # use current vel for pos (mid-point is better but consistent)
-        self.x[3:6] = new_vel
+        self.x[:3]   = new_pos
+        self.x[3:6]  = new_vel
         self.x[6:10] = new_quat
+        # Bias states integrate as a random walk (no deterministic dynamics)
 
+        # --- State transition Jacobian F (16×16) ---------------------------
         F = np.eye(self.n)
+
+        # Position → velocity coupling
         F[0:3, 3:6] = np.eye(3) * self.dt
+
+        # Quaternion kinematics Jacobian (∂new_q / ∂q)
         F[6:10, 6:10] = np.eye(4) + quat_angular_velocity_jacobian(gyro_c) * self.dt
+
+        if accel_c is not None:
+            R = quat_to_rotation_matrix(quat)
+
+            # Velocity sensitivity to accel_bias: ∂vel_new/∂b_a = -R*dt
+            F[3:6, 10:13] = -R * self.dt
+
+            # Position sensitivity to accel_bias (from midpoint term)
+            F[0:3, 10:13] = -0.5 * R * self.dt ** 2
+
+        # Quaternion sensitivity to gyro_bias: ∂new_q/∂b_g = -∂q_dot/∂ω * dt
+        # q_dot = 0.5 * quat_multiply(q, [0, ω]), so ∂q_dot/∂ω is the 4×3 matrix Xi(q):
+        #   Xi(q) = 0.5 * [[-x,-y,-z], [w,-z,y], [z,w,-x], [-y,x,w]]
+        w, x, y, z = quat
+        Xi = 0.5 * np.array([
+            [-x, -y, -z],
+            [ w, -z,  y],
+            [ z,  w, -x],
+            [-y,  x,  w],
+        ])
+        F[6:10, 13:16] = -Xi * self.dt
 
         self.P = F @ self.P @ F.T + self.Q
 
@@ -141,14 +191,13 @@ class ExtendedKalmanFilter:
 
         Only corrects quaternion — velocity is propagated in predict() from
         the same accel measurement.  The attitude update columns of H are
-        non-zero; position/velocity columns are zero.
+        non-zero; position/velocity/bias columns are zero.
         """
-        quat = self.x[6:10]
-        R = quat_to_rotation_matrix(quat)
-        # Expected specific force in body frame = R^T @ g_up
-        # At rest/level: IMU reads +g in the body z-axis (reaction to gravity).
-        expected = R.T @ self.gravity  # NOT -R.T — sign was the bug
-        residual = (accel - self.accel_bias) - expected
+        quat      = self.x[6:10]
+        accel_bias = self.x[10:13]
+        R         = quat_to_rotation_matrix(quat)
+        expected  = R.T @ self.gravity
+        residual  = (accel - accel_bias) - expected
 
         H = self._accel_jacobian(quat)
         S = H @ self.P @ H.T + self.R_accel
@@ -160,15 +209,17 @@ class ExtendedKalmanFilter:
             f"EKF quaternion norm={np.linalg.norm(self.x[6:10]):.6f} after correct_accel "
             "\u2014 filter diverging"
         )
-        self.P = (np.eye(self.n) - K @ H) @ self.P
+        # Joseph form: P = (I-KH)P(I-KH)^T + K*R_accel*K^T
+        IKH = np.eye(self.n) - K @ H
+        self.P = IKH @ self.P @ IKH.T + K @ self.R_accel @ K.T
 
     # -- magnetometer correction -------------------------------------------
 
     def correct_mag(self, mag: NDArray) -> None:
         quat = self.x[6:10]
-        R = quat_to_rotation_matrix(quat)
+        R    = quat_to_rotation_matrix(quat)
         expected = R.T @ self.mag_ref
-        residual = (mag - self.mag_bias) - expected
+        residual = mag - expected    # mag has its own fixed bias; no state bias term
 
         H = self._mag_jacobian(quat)
         S = H @ self.P @ H.T + self.R_mag
@@ -180,7 +231,8 @@ class ExtendedKalmanFilter:
             f"EKF quaternion norm={np.linalg.norm(self.x[6:10]):.6f} after correct_mag "
             "\u2014 filter diverging"
         )
-        self.P = (np.eye(self.n) - K @ H) @ self.P
+        IKH = np.eye(self.n) - K @ H
+        self.P = IKH @ self.P @ IKH.T + K @ self.R_mag @ K.T
 
     # -- GPS / barometer position correction -------------------------------
 
@@ -198,26 +250,47 @@ class ExtendedKalmanFilter:
         K = self.P @ H.T @ np.linalg.inv(S)
         self.x += K @ residual
         self.x[6:10] = quat_normalize(self.x[6:10])
-        self.P = (np.eye(self.n) - K @ H) @ self.P
+        IKH = np.eye(self.n) - K @ H
+        self.P = IKH @ self.P @ IKH.T + K @ R_pos @ K.T
+
+    def correct_velocity(
+        self, vel_meas: NDArray, R_vel: NDArray | None = None
+    ) -> None:
+        """3-D velocity update from GPS Doppler / DVL.  vel_meas shape: (3,)."""
+        if R_vel is None:
+            R_vel = np.eye(3) * 0.01   # GPS vel std~0.1 m/s → var=0.01
+        H = np.zeros((3, self.n))
+        H[0:3, 3:6] = np.eye(3)
+        residual = vel_meas - self.x[3:6]
+        S = H @ self.P @ H.T + R_vel
+        K = self.P @ H.T @ np.linalg.inv(S)
+        self.x += K @ residual
+        self.x[6:10] = quat_normalize(self.x[6:10])
+        IKH = np.eye(self.n) - K @ H
+        self.P = IKH @ self.P @ IKH.T + K @ R_vel @ K.T
 
     def correct_altitude(self, z_meas: float, r_z: float = 0.05) -> None:
         """1-D barometer altitude update.  Anchors vertical dead-reckoning."""
         H = np.zeros((1, self.n))
-        H[0, 2] = 1.0  # h(x) = z  →  H[0,2] = 1
+        H[0, 2] = 1.0
         residual = np.array([z_meas - self.x[2]])
-        S = H @ self.P @ H.T + np.array([[r_z]])
-        K = self.P @ H.T @ np.linalg.inv(S)  # shape (10, 1)
+        R_z = np.array([[r_z]])
+        S = H @ self.P @ H.T + R_z
+        K = self.P @ H.T @ np.linalg.inv(S)
         self.x += (K @ residual).ravel()
         self.x[6:10] = quat_normalize(self.x[6:10])
-        self.P = (np.eye(self.n) - K @ H) @ self.P
+        IKH = np.eye(self.n) - K @ H
+        self.P = IKH @ self.P @ IKH.T + K @ R_z @ K.T
 
     # -- state access ------------------------------------------------------
 
     def get_state(self) -> dict:
         return {
-            "position": self.x[:3].copy(),
-            "velocity": self.x[3:6].copy(),
+            "position":   self.x[:3].copy(),
+            "velocity":   self.x[3:6].copy(),
             "quaternion": self.x[6:10].copy(),
+            "accel_bias": self.x[10:13].copy(),
+            "gyro_bias":  self.x[13:16].copy(),
         }
 
     # -- Jacobians (analytical) --------------------------------------------
@@ -236,7 +309,7 @@ class ExtendedKalmanFilter:
             H_proj[:, 6:10] = H_raw[:, 6:10] - outer(H_raw[:, 6:10] @ q, q)
 
         This removes the radial (along-q) component that normalization kills.
-        State layout: indices 6-9 = [qw, qx, qy, qz].
+        State layout (16-state): indices 6-9 = [qw, qx, qy, qz]; bias columns are zero.
         """
         w, x, y, z = q
         gx, gy, gz = self.gravity
@@ -261,7 +334,6 @@ class ExtendedKalmanFilter:
         H[2, 9] =  2 * x * gx + 2 * y * gy
 
         # Tangent-space projection: remove the component along q (radial direction)
-        # so the Jacobian matches d(R(q/|q|)^T g)/dq as computed by the EKF.
         Hq = H[:, 6:10]           # (3, 4)
         H[:, 6:10] = Hq - np.outer(Hq @ q, q)
 
@@ -273,6 +345,7 @@ class ExtendedKalmanFilter:
         Identical structure to _accel_jacobian: both compute d(R^T v)/dq for a
         constant reference vector v (gravity vs. mag_ref).
         Includes tangent-space projection (see _accel_jacobian docstring).
+        State layout (16-state): indices 6-9 = [qw, qx, qy, qz]; bias columns are zero.
         """
         w, x, y, z = q
         mx, my, mz = self.mag_ref

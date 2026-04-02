@@ -144,9 +144,10 @@ def main():
 
         # GPS at 10 Hz: step() includes dropout check
         if i % 10 == 0:
-            gps_pos, _, gps_valid = gps.step(pos, vel)
+            gps_pos, gps_vel, gps_valid = gps.step(pos, vel)
             if gps_valid:
-                ekf.correct_position(gps_pos, R_pos=np.eye(3) * 0.25)  # σ=0.5 m
+                ekf.correct_position(gps_pos, R_pos=np.eye(3) * 0.25)   # σ=0.5 m
+                ekf.correct_velocity(gps_vel, R_vel=np.eye(3) * 0.01)   # σ=0.1 m/s
 
         est = ekf.get_state()
 
