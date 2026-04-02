@@ -2,13 +2,13 @@
 """Example 06: Full pipeline — EKF-fused 3-D trajectory following.
 
 Extends example 05 from single-altitude hover control to full 3-D trajectory
-tracking.  A minimum-snap reference is pre-computed through a circuit of
-waypoints; a cascaded PID controller tracks it while an EKF fuses IMU +
-barometer + GPS measurements in the background.
+tracking.  A predefined circular trajectory is used as the reference;
+a cascaded PID controller tracks it while an EKF fuses IMU + barometer +
+GPS measurements in the background.
 
 Architecture::
 
-    generate_minimum_snap  →  QuadcopterController  →  QuadcopterDynamics
+    generate_circular      →  QuadcopterController  →  QuadcopterDynamics
          (reference)              (cascaded PID)        (RK4 + motor lag)
                                                                ↓
                                                    IMU/baro/GPS simulation
@@ -29,33 +29,25 @@ from drones_sim.control import QuadcopterController
 from drones_sim.sensors.models import SensorNoiseModel
 from drones_sim.sensors import GPSSimulator, GPSConfig
 from drones_sim.estimation import ExtendedKalmanFilter
-from drones_sim.trajectory import generate_minimum_snap
+from drones_sim.trajectory import generate_circular
 from drones_sim.math_utils import euler_to_rotation_matrix
 from drones_sim.visualization.viewer import DroneViewer
 
 
 def main():
     # ------------------------------------------------------------------ #
-    # Minimum-snap reference trajectory
+    # Predefined reference trajectory  (circular, R=3 m, ω=0.4 rad/s)
     # ------------------------------------------------------------------ #
-    # A 3-D circuit:  ground → climb → east leg → NE corner → north leg
-    #                 → return → land.
-    waypoints = [
-        (0.0, 0.0, 0.0),   # t= 0 s  ground
-        (0.0, 0.0, 2.0),   # t= 3 s  take-off hover
-        (3.0, 0.0, 2.0),   # t= 8 s  east leg
-        (3.0, 3.0, 3.0),   # t=13 s  NE corner, climb to 3 m
-        (0.0, 3.0, 2.5),   # t=18 s  north leg
-        (0.0, 0.0, 2.0),   # t=22 s  back to take-off altitude
-        (0.0, 0.0, 0.0),   # t=26 s  land
-    ]
-    wp_times = [0.0, 3.0, 8.0, 13.0, 18.0, 22.0, 26.0]
-
     dt = 0.01
-    traj = generate_minimum_snap(waypoints, times=wp_times, dt=dt)
+    traj = generate_circular(
+        duration=30.0,
+        sample_rate=int(1 / dt),
+        radius=3.0,
+        angular_vel=0.4,
+    )
     n = len(traj.t)
     t = traj.t
-    print(f"Trajectory: {n} steps over {t[-1]:.1f} s  ({len(waypoints)} waypoints)")
+    print(f"Trajectory: {n} steps over {t[-1]:.1f} s")
 
     # ------------------------------------------------------------------ #
     # Dynamics  (RK4 integration + 40 ms rotor lag)
@@ -112,7 +104,9 @@ def main():
     # ------------------------------------------------------------------ #
     # Closed-loop simulation
     # ------------------------------------------------------------------ #
-    quad.reset()
+    # Start the drone at the trajectory's initial position so tracking error
+    # begins at zero rather than spanning the distance to the first point.
+    quad.reset(position=traj.position[0].copy())
     ctrl.reset()
     motors = None
 
@@ -226,10 +220,9 @@ def main():
                     label="Reference")
     axes[1, 0].plot(true_pos[:, 0], true_pos[:, 1], "b-",  lw=1.0,
                     label="True")
-    axes[1, 0].plot(est_pos[:, 0],  est_pos[:, 1],  "r:",  lw=0.8,
-                    label="EKF estimate")
-    for wp in waypoints:
-        axes[1, 0].plot(wp[0], wp[1], "rs", ms=7, zorder=5)
+    axes[1, 0].plot(
+        est_pos[:, 0], est_pos[:, 1], "r:", lw=0.8, label="EKF estimate"
+    )
     axes[1, 0].set_xlabel("X (m)")
     axes[1, 0].set_ylabel("Y (m)")
     axes[1, 0].set_title("XY Path (top-down)")
@@ -264,7 +257,6 @@ def main():
         rotations,
         filtered_positions=est_pos,
         reference_positions=ref_pos,
-        waypoints=[(float(w[0]), float(w[1]), float(w[2])) for w in waypoints],
     )
 
 
