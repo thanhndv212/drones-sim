@@ -80,14 +80,36 @@ class ExtendedKalmanFilter:
 
     # -- prediction --------------------------------------------------------
 
-    def predict(self, gyro: NDArray) -> None:
+    def predict(self, gyro: NDArray, accel: NDArray | None = None) -> None:
+        """Propagate state forward by dt.
+
+        Args:
+            gyro:  Body-frame angular velocity (rad/s), 3-vector.
+            accel: Body-frame specific force (m/s²), 3-vector.
+                   When provided, linear acceleration is integrated into velocity.
+                   This is the IMU pre-integration path and is the primary way the
+                   EKF tracks translational motion without GPS.
+                   If None the velocity state is held constant (attitude-only mode).
+        """
         pos, vel, quat = self.x[:3], self.x[3:6], self.x[6:10]
         gyro_c = gyro - self.gyro_bias
 
         q_dot = quat_derivative(quat, gyro_c)
         new_quat = quat_normalize(quat + q_dot * self.dt)
 
-        self.x[:3] = pos + vel * self.dt
+        # Velocity propagation from IMU specific force
+        if accel is not None:
+            R = quat_to_rotation_matrix(quat)
+            # specific force in world frame, minus gravity = linear accel
+            a_world = R @ (accel - self.accel_bias) - self.gravity
+            new_vel = vel + a_world * self.dt
+        else:
+            new_vel = vel
+
+        self.x[:3] = (
+            pos + vel * self.dt
+        )  # use current vel for pos (mid-point is better but consistent)
+        self.x[3:6] = new_vel
         self.x[6:10] = new_quat
 
         F = np.eye(self.n)
@@ -99,9 +121,17 @@ class ExtendedKalmanFilter:
     # -- accelerometer correction ------------------------------------------
 
     def correct_accel(self, accel: NDArray) -> None:
+        """Attitude correction from accelerometer (gravity direction).
+
+        Only corrects quaternion — velocity is propagated in predict() from
+        the same accel measurement.  The attitude update columns of H are
+        non-zero; position/velocity columns are zero.
+        """
         quat = self.x[6:10]
         R = quat_to_rotation_matrix(quat)
-        expected = -R.T @ self.gravity
+        # Expected specific force in body frame = R^T @ g_up
+        # At rest/level: IMU reads +g in the body z-axis (reaction to gravity).
+        expected = R.T @ self.gravity  # NOT -R.T — sign was the bug
         residual = (accel - self.accel_bias) - expected
 
         H = self._accel_jacobian(quat)
@@ -111,11 +141,6 @@ class ExtendedKalmanFilter:
         self.x += K @ residual
         self.x[6:10] = quat_normalize(self.x[6:10])
         self.P = (np.eye(self.n) - K @ H) @ self.P
-
-        # velocity update from accelerometer
-        accel_world = R @ (accel - self.accel_bias) + self.gravity
-        alpha = 0.1
-        self.x[3:6] = (1 - alpha) * self.x[3:6] + alpha * (self.x[3:6] + accel_world * self.dt)
 
     # -- magnetometer correction -------------------------------------------
 
@@ -133,6 +158,35 @@ class ExtendedKalmanFilter:
         self.x[6:10] = quat_normalize(self.x[6:10])
         self.P = (np.eye(self.n) - K @ H) @ self.P
 
+    # -- GPS / barometer position correction -------------------------------
+
+    def correct_position(
+        self, pos_meas: NDArray, R_pos: NDArray | None = None
+    ) -> None:
+        """Full 3-D GPS position update.  pos_meas shape: (3,)."""
+        m = len(pos_meas)
+        if R_pos is None:
+            R_pos = np.eye(m) * 0.1
+        H = np.zeros((m, self.n))
+        H[:m, :m] = np.eye(m)
+        residual = pos_meas - self.x[:m]
+        S = H @ self.P @ H.T + R_pos
+        K = self.P @ H.T @ np.linalg.inv(S)
+        self.x += K @ residual
+        self.x[6:10] = quat_normalize(self.x[6:10])
+        self.P = (np.eye(self.n) - K @ H) @ self.P
+
+    def correct_altitude(self, z_meas: float, r_z: float = 0.05) -> None:
+        """1-D barometer altitude update.  Anchors vertical dead-reckoning."""
+        H = np.zeros((1, self.n))
+        H[0, 2] = 1.0  # h(x) = z  →  H[0,2] = 1
+        residual = np.array([z_meas - self.x[2]])
+        S = H @ self.P @ H.T + np.array([[r_z]])
+        K = self.P @ H.T @ np.linalg.inv(S)  # shape (10, 1)
+        self.x += (K @ residual).ravel()
+        self.x[6:10] = quat_normalize(self.x[6:10])
+        self.P = (np.eye(self.n) - K @ H) @ self.P
+
     # -- state access ------------------------------------------------------
 
     def get_state(self) -> dict:
@@ -145,27 +199,33 @@ class ExtendedKalmanFilter:
     # -- Jacobians (analytical) --------------------------------------------
 
     def _accel_jacobian(self, q: NDArray) -> NDArray:
-        """d(R^T g)/d(quat) — analytical Jacobian of accel measurement model."""
+        """Analytical Jacobian d(R^T @ g)/dq for the accelerometer measurement model.
+
+        Derived from the Hamilton quaternion rotation matrix:
+          R[w,x,y,z] (body→world), so R^T maps world→body.
+        State layout: indices 6-9 = [qw, qx, qy, qz].
+        """
         w, x, y, z = q
         gx, gy, gz = self.gravity
         H = np.zeros((3, self.n))
 
-        # Partial derivatives of R^T @ gravity w.r.t. each quaternion component
-        # Negated because accelerometer measures reaction force
-        H[0, 6] = -2 * (2 * w * gz - 2 * gy * y + 2 * gx * z)
-        H[0, 7] = -2 * (2 * gz * w - 2 * gy * z)
-        H[0, 8] = -2 * (-2 * gx * z - 2 * gz * x)
-        H[0, 9] = -2 * (2 * gx * y - 2 * gy * x)
+        # Row 0:  d(R^T @ g)[0] / d[w, x, y, z]
+        H[0, 6] = 2 * z * gy - 2 * y * gz
+        H[0, 7] = 2 * y * gy + 2 * z * gz
+        H[0, 8] = -4 * y * gx + 2 * x * gy - 2 * w * gz
+        H[0, 9] = -4 * z * gx + 2 * w * gy + 2 * x * gz
 
-        H[1, 6] = -2 * (2 * gz * y - 2 * gx * z)
-        H[1, 7] = -2 * (2 * gy * w + 2 * gz * z)
-        H[1, 8] = -2 * (2 * w * gz - 2 * gx * y)
-        H[1, 9] = -2 * (2 * gz * x + 2 * gy * w)
+        # Row 1:  d(R^T @ g)[1] / d[w, x, y, z]
+        H[1, 6] = -2 * z * gx + 2 * x * gz
+        H[1, 7] = 2 * y * gx - 4 * x * gy + 2 * w * gz
+        H[1, 8] = 2 * x * gx + 2 * z * gz
+        H[1, 9] = -2 * w * gx - 4 * z * gy + 2 * y * gz
 
-        H[2, 6] = -2 * (-2 * gy * w - 2 * gx * x)
-        H[2, 7] = -2 * (-2 * gx * w - 2 * gy * x)
-        H[2, 8] = -2 * (-2 * gy * y - 2 * gz * z)
-        H[2, 9] = -2 * (2 * gx * w - 2 * gy * z)
+        # Row 2:  d(R^T @ g)[2] / d[w, x, y, z]
+        H[2, 6] = 2 * y * gx - 2 * x * gy
+        H[2, 7] = 2 * z * gx - 2 * w * gy - 4 * x * gz
+        H[2, 8] = 2 * w * gx + 2 * z * gy - 4 * y * gz
+        H[2, 9] = 2 * x * gx + 2 * y * gy
 
         return H
 

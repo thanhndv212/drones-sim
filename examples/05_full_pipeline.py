@@ -40,14 +40,34 @@ def main():
     accel_noise = SensorNoiseModel(noise_std=0.05, bias_range=0.1)
     gyro_noise = SensorNoiseModel(noise_std=0.01, bias_range=0.005)
     mag_noise = SensorNoiseModel(noise_std=0.5, bias_range=1.0)
+    baro_noise = SensorNoiseModel(
+        noise_std=0.02, bias_range=0.05
+    )  # barometer σ≈2 cm
+    gps_noise = SensorNoiseModel(noise_std=0.5, bias_range=0.3)  # GPS σ≈0.5 m
 
     # EKF
     init_state = np.zeros(10)
     init_state[6] = 1.0  # identity quat
     ekf = ExtendedKalmanFilter(dt=dt, initial_state=init_state, gravity=gravity, mag_ref=mag_ref)
 
+    # --- EKF noise tuning ---
+    # Loosen velocity process noise so filter tracks dynamics quickly
+    ekf.Q[3:6, 3:6] = np.eye(3) * 0.02  # was ~1e-5
+    ekf.Q[6:10, 6:10] = np.eye(4) * 0.002  # was ~1e-6
+    # Initial velocity uncertainty — honest starting point
+    ekf.P[3:6, 3:6] = np.eye(3) * 0.5
+    # Trust accelerometer closer to its actual noise level (std=0.05 → var≈0.003)
+    ekf.R_accel = np.eye(3) * 0.003
+
     # Simple hover controller (just z-axis for demonstration)
-    z_ctrl = PIDController(kp=20, ki=5, kd=10, output_limits=(0, 30), windup_limits=(-15, 15))
+    # Output spans ±8 N around the hover feedforward; no positive-only clamp needed.
+    z_ctrl = PIDController(
+        kp=6.0,
+        ki=2.0,
+        kd=4.0,
+        output_limits=(-8.0, 8.0),
+        windup_limits=(-3.0, 3.0),
+    )
     target_z = 2.0
 
     # Logging
@@ -60,6 +80,7 @@ def main():
     targets_log = np.zeros((n, 3))
 
     quad.reset()
+    motors = None  # needed for first-step specific-force computation
 
     for i in range(n):
         # --- True state ---
@@ -70,8 +91,31 @@ def main():
         R_true = euler_to_rotation_matrix(*att)
 
         # --- Simulate sensors ---
-        # Accelerometer: gravity in body + linear accel (simplified)
-        true_accel_body = R_true.T @ gravity
+        # Accelerometer measures specific force = R^T * (a_linear - g_world)
+        # which in hover (a_linear ≈ 0) is just R^T * g (the reaction to gravity).
+        # We approximate linear accel from the previous dynamics step.
+        lin_accel_world = np.array([0.0, 0.0, quad.g]) - np.array(
+            [0.0, 0.0, quad.g]
+        )
+        # Proper: rotate net force / mass back to body frame as specific force
+        # F_net/m = accel (world); specific force = R^T * accel - R^T * (-g) = R^T*(accel + g_vec)
+        # In body frame: a_body = R^T * accel_world_total (thrust + drag + gravity) / m
+        # Simplest correct formula: specific force = R^T @ (a_total_world + [0,0,g])
+        # We read velocity to get accel via finite diff, but easiest is to use dynamics output.
+        # Use quad state: accel = dv/dt → computed in update(); approximate as (vel-vel_prev)/dt
+        true_accel_body = (
+            R_true.T @ gravity
+        )  # static gravity component (attitude reference)
+        # Add linear dynamics contribution so EKF velocity tracking works
+        # thrust accel in world frame = R * [0,0,T/m] ; drag = -k_d*v/m
+        if i > 0 and motors is not None:
+            T_over_m = float(np.sum(motors**2) * quad.k_f / quad.mass)
+            a_thrust_world = R_true @ np.array([0.0, 0.0, T_over_m])
+            a_drag_world = -quad.k_d * vel / quad.mass
+            a_grav_world = np.array([0.0, 0.0, -quad.g])
+            a_total_world = a_thrust_world + a_drag_world + a_grav_world
+            # specific force = R^T * a_total + g_body  (what IMU actually measures)
+            true_accel_body = R_true.T @ (a_total_world + gravity)
         accel_meas = accel_noise.apply(true_accel_body)
 
         gyro_meas = gyro_noise.apply(omega)
@@ -79,9 +123,21 @@ def main():
         mag_meas = mag_noise.apply(mag_body)
 
         # --- EKF update ---
-        ekf.predict(gyro_meas)
-        ekf.correct_accel(accel_meas)
+        # Pass accel to predict() so velocity is propagated via IMU pre-integration.
+        # (gyro-only predict kept velocity constant → massive position drift)
+        ekf.predict(gyro_meas, accel_meas)
+        ekf.correct_accel(accel_meas)  # attitude-only correction
         ekf.correct_mag(mag_meas)
+        # Barometer: noisy altitude measurement anchors vertical dead-reckoning.
+        # Without this, EKF position drifts hundreds of metres from velocity integration.
+        z_baro = float(baro_noise.apply(np.array([pos[2]]))[0])
+        ekf.correct_altitude(z_baro, r_z=0.0004)  # var = (0.02)^2
+        # GPS at 10 Hz: anchors x/y against dead-reckoning drift
+        if i % 10 == 0:
+            gps_meas = gps_noise.apply(pos.copy())  # noisy true position
+            ekf.correct_position(
+                gps_meas, R_pos=np.eye(3) * 0.25
+            )  # σ=0.5m → var=0.25
         est = ekf.get_state()
 
         # --- Control using EKF estimate ---
@@ -89,10 +145,23 @@ def main():
         thrust_cmd = z_ctrl.update(target_z, est_z, dt)
 
         # Convert thrust to equal motor speeds
-        hover_base = quad.g * quad.mass * quad.k_f
-        total_thrust = thrust_cmd + hover_base
+        # Feedforward provides full m*g; PID corrects the residual error around hover.
+        # (Old code used quad.g * quad.mass * quad.k_f ≈ 9.81e-6 N — nearly zero!)
+        hover_thrust = quad.g * quad.mass  # 9.81 N
+        total_thrust = thrust_cmd + hover_thrust  # PID output ± feedforward
         motor_speed = np.sqrt(max(total_thrust / (4 * quad.k_f), 0))
         motors = np.full(4, motor_speed)
+
+        # --- Debug every 1 s (100 steps) ---
+        if i % 100 == 0:
+            est_err_z = pos[2] - est_z
+            ctrl_err = target_z - pos[2]
+            print(
+                f"t={t[i]:5.2f}s | "
+                f"true_z={pos[2]:7.4f}  ekf_z={est_z:7.4f}  target={target_z:.2f} | "
+                f"ctrl_err={ctrl_err:+7.4f}  est_err={est_err_z:+7.4f} | "
+                f"thrust_cmd={thrust_cmd:+6.3f}  motor_ω={motor_speed:8.1f} rad/s"
+            )
 
         # --- Step dynamics ---
         quad.update(dt, motors)
