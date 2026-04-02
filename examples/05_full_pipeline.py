@@ -2,12 +2,11 @@
 """Example 05: Full pipeline — EKF sensor fusion + quadcopter control.
 
 This is the key integration example that wires together:
-1. Quadcopter dynamics simulation
-2. IMU sensor simulation from the dynamics state
-3. EKF state estimation from noisy IMU readings
-4. Cascaded PID control using EKF-estimated state
-
-This closes the loop that was missing in the original codebase.
+1. Quadcopter dynamics simulation  (RK4 integration + motor first-order lag)
+2. IMU sensor simulation with Gauss-Markov bias random walk
+3. GPS sensor simulation via GPSSimulator (replaces raw noise model)
+4. EKF state estimation fusing IMU, barometer, and GPS
+5. Cascaded PID control using EKF-estimated state
 """
 
 import os
@@ -17,6 +16,7 @@ import matplotlib.pyplot as plt
 from drones_sim.dynamics import QuadcopterDynamics
 from drones_sim.control.pid import PIDController
 from drones_sim.sensors.models import SensorNoiseModel
+from drones_sim.sensors import GPSSimulator, GPSConfig
 from drones_sim.estimation import ExtendedKalmanFilter
 from drones_sim.math_utils import (
     euler_to_rotation_matrix,
@@ -33,7 +33,8 @@ def main():
     _CHECK_NIS = os.getenv("CHECK_NIS", "0") == "1"
 
     # --- Setup ---
-    quad = QuadcopterDynamics()
+    # motor_time_constant adds first-order rotor lag (τ=40 ms) to the dynamics.
+    quad = QuadcopterDynamics(motor_time_constant=0.04)
     dt = 0.01
     t_max = 10.0
     n = int(t_max / dt)
@@ -42,14 +43,19 @@ def main():
     gravity = np.array([0.0, 0.0, 9.81])
     mag_ref = np.array([25.0, 5.0, -40.0])
 
-    # Sensor noise models
-    accel_noise = SensorNoiseModel(noise_std=0.05, bias_range=0.1)
-    gyro_noise = SensorNoiseModel(noise_std=0.01, bias_range=0.005)
+    # Sensor noise models (accel/gyro use Gauss-Markov bias random walk)
+    accel_noise = SensorNoiseModel(
+        noise_std=0.05, bias_range=0.1,
+        bias_time_constant=20.0, bias_random_walk_std=0.005,
+    )
+    gyro_noise = SensorNoiseModel(
+        noise_std=0.01, bias_range=0.005,
+        bias_time_constant=60.0, bias_random_walk_std=0.001,
+    )
     mag_noise = SensorNoiseModel(noise_std=0.5, bias_range=1.0)
-    baro_noise = SensorNoiseModel(
-        noise_std=0.02, bias_range=0.05
-    )  # barometer σ≈2 cm
-    gps_noise = SensorNoiseModel(noise_std=0.5, bias_range=0.3)  # GPS σ≈0.5 m
+    baro_noise = SensorNoiseModel(noise_std=0.02, bias_range=0.05)  # barometer σ≈2 cm
+    # GPSSimulator provides a proper low-rate GNSS receiver model at 10 Hz.
+    gps = GPSSimulator(GPSConfig(position_noise_std=0.5, velocity_noise_std=0.1, update_rate=10.0))
 
     # EKF
     init_state = np.zeros(10)
@@ -122,9 +128,10 @@ def main():
             a_total_world = a_thrust_world + a_drag_world + a_grav_world
             # specific force = R^T * a_total + g_body  (what IMU actually measures)
             true_accel_body = R_true.T @ (a_total_world + gravity)
-        accel_meas = accel_noise.apply(true_accel_body)
+        # Pass dt so Gauss-Markov bias random walk is propagated each step.
+        accel_meas = accel_noise.apply(true_accel_body, dt=dt)
 
-        gyro_meas = gyro_noise.apply(omega)
+        gyro_meas = gyro_noise.apply(omega, dt=dt)
         mag_body = R_true.T @ mag_ref
         mag_meas = mag_noise.apply(mag_body)
 
@@ -138,12 +145,11 @@ def main():
         # Without this, EKF position drifts hundreds of metres from velocity integration.
         z_baro = float(baro_noise.apply(np.array([pos[2]]))[0])
         ekf.correct_altitude(z_baro, r_z=0.0004)  # var = (0.02)^2
-        # GPS at 10 Hz: anchors x/y against dead-reckoning drift
+        # GPS at 10 Hz: use GPSSimulator.step() — respects update_rate via index guard.
         if i % 10 == 0:
-            gps_meas = gps_noise.apply(pos.copy())  # noisy true position
-            ekf.correct_position(
-                gps_meas, R_pos=np.eye(3) * 0.25
-            )  # σ=0.5m → var=0.25
+            gps_pos, _, gps_valid = gps.step(pos, vel)
+            if gps_valid:
+                ekf.correct_position(gps_pos, R_pos=np.eye(3) * 0.25)  # σ=0.5m → var=0.25
         est = ekf.get_state()
 
         # --- NIS check (opt-in: CHECK_NIS=1 env var) ---
