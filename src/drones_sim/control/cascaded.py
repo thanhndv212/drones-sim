@@ -18,11 +18,11 @@ class QuadcopterController:
     def __init__(self, quad: QuadcopterDynamics):
         self.quad = quad
         self.convergence_threshold = 0.05
-        self.max_lateral_speed = 1.5
+        self.max_lateral_speed = 3.0          # increased from 1.5 for trajectory tracking
         self.max_vertical_speed = 1.0
-        self.max_lateral_accel = 3.0
+        self.max_lateral_accel = 5.0          # increased from 3.0
         self.max_vertical_accel = 4.0
-        self.max_tilt = np.deg2rad(17.0)
+        self.max_tilt = np.deg2rad(25.0)      # increased from 17° — was saturating 74% of the time
         self.max_torque = np.array([0.25, 0.25, 0.08])
         self.rate_damping = np.array([0.03, 0.03, 0.015])
         self.min_thrust = 0.2 * self.quad.mass * self.quad.g
@@ -30,27 +30,32 @@ class QuadcopterController:
         self.max_motor_speed = 4000.0
 
         # -- Position (outer) --
-        self.x_ctrl = PIDController(1.2, 0.1, 0.35, (-1.5, 1.5), (-1.0, 1.0))
-        self.y_ctrl = PIDController(1.2, 0.1, 0.35, (-1.5, 1.5), (-1.0, 1.0))
+        # Wider output limits match new max_lateral_speed; higher kp+kd for
+        # faster acquisition of a moving reference.
+        self.x_ctrl = PIDController(1.8, 0.1, 0.5, (-3.0, 3.0), (-1.0, 1.0))
+        self.y_ctrl = PIDController(1.8, 0.1, 0.5, (-3.0, 3.0), (-1.0, 1.0))
         self.z_ctrl = PIDController(1.6, 0.25, 0.45, (-1.0, 1.0), (-0.8, 0.8))
 
         # -- Velocity (middle) --
-        self.vx_ctrl = PIDController(2.2, 0.3, 0.2, (-3.0, 3.0), (-1.0, 1.0))
-        self.vy_ctrl = PIDController(2.2, 0.3, 0.2, (-3.0, 3.0), (-1.0, 1.0))
+        # Higher kp and wider limits feed more accel demand to the attitude loop.
+        self.vx_ctrl = PIDController(3.0, 0.4, 0.3, (-5.0, 5.0), (-1.0, 1.0))
+        self.vy_ctrl = PIDController(3.0, 0.4, 0.3, (-5.0, 5.0), (-1.0, 1.0))
         self.vz_ctrl = PIDController(5.0, 1.5, 0.3, (-4.0, 4.0), (-1.0, 1.0))
 
         # -- Attitude (inner, torque outputs in N·m) --
+        # kp doubled + kd added so the drone reaches the commanded tilt quickly;
+        # without this, the attitude loop is the bottleneck at high tilt angles.
         self.roll_ctrl = PIDController(
-            0.12,
-            0.02,
-            0.0,
+            0.25,
+            0.03,
+            0.08,
             (-0.25, 0.25),
             (-0.15, 0.15),
         )
         self.pitch_ctrl = PIDController(
-            0.12,
-            0.02,
-            0.0,
+            0.25,
+            0.03,
+            0.08,
             (-0.25, 0.25),
             (-0.15, 0.15),
         )
@@ -112,7 +117,9 @@ class QuadcopterController:
             self.y_ctrl.update(target_pos[1], pos[1], dt),
             self.z_ctrl.update(target_pos[2], pos[2], dt),
         ])
-        target_vel += np.array([0.25, 0.25, 0.15]) * target_vel_ff
+        # High FF coefficient (0.9) directly injects trajectory velocity so
+        # the drone doesn't have to build up a large position error first.
+        target_vel += np.array([0.9, 0.9, 0.15]) * target_vel_ff
         target_vel = np.clip(
             target_vel,
             [
@@ -135,7 +142,7 @@ class QuadcopterController:
         ])
         target_acc_ff = (target_vel - self._prev_target_vel) / max(dt, 1e-6)
         self._prev_target_vel = target_vel.copy()
-        desired_accel += np.array([0.1, 0.1, 0.05]) * target_acc_ff
+        desired_accel += np.array([0.3, 0.3, 0.05]) * target_acc_ff
         desired_accel[:2] = np.clip(
             desired_accel[:2],
             -self.max_lateral_accel,
