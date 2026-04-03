@@ -82,6 +82,7 @@ def main():
     # EKF (runs as an observer alongside the true-state controller)
     # ------------------------------------------------------------------ #
     init_state = np.zeros(10)
+    init_state[0:3] = traj.position[0]      # seed position with drone's start
     init_state[6] = 1.0                     # identity quaternion w=1
     ekf = ExtendedKalmanFilter(
         dt=dt, initial_state=init_state, gravity=gravity, mag_ref=mag_ref,
