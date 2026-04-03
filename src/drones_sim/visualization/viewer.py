@@ -115,6 +115,38 @@ class DroneViewer:
 
         return frame_name
 
+    def add_world_frame(self, axes_length: float = 0.6) -> object:
+        """Add a static world-frame axes indicator at the origin.
+
+        Returns the scene-node handle (has a ``.visible`` property).
+        """
+        return self.server.scene.add_frame(
+            "/world_frame",
+            wxyz=(1.0, 0.0, 0.0, 0.0),
+            position=(0.0, 0.0, 0.0),
+            show_axes=True,
+            axes_length=axes_length,
+            axes_radius=axes_length * 0.02,
+        )
+
+    def add_body_frame_axes(self, parent_frame_name: str, axes_length: float = 0.3) -> object:
+        """Add body-frame axes as a child of *parent_frame_name*.
+
+        Because viser honours the ``/parent/child`` scene-graph hierarchy,
+        these axes automatically follow the drone's pose without any
+        per-frame update calls.
+
+        Returns the scene-node handle (has a ``.visible`` property).
+        """
+        return self.server.scene.add_frame(
+            f"{parent_frame_name}/body_axes",
+            wxyz=(1.0, 0.0, 0.0, 0.0),
+            position=(0.0, 0.0, 0.0),
+            show_axes=True,
+            axes_length=axes_length,
+            axes_radius=axes_length * 0.02,
+        )
+
     def update_quadcopter_pose(
         self,
         frame_name: str,

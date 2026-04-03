@@ -214,7 +214,9 @@ def main() -> None:
     _push_cloud(srv, "ref_traj",      traj.position, (50, 220, 80),  0.03)
     _push_cloud(srv, "true_traj",     true_pos,      (0, 120, 255),  0.02)
     _push_cloud(srv, "filtered_traj", est_pos,       (255, 80, 0),   0.02)
-    frame_name = viewer.add_quadcopter_frame()
+    frame_name       = viewer.add_quadcopter_frame()
+    world_frame_hdl  = viewer.add_world_frame(axes_length=0.6)
+    body_frame_hdl   = viewer.add_body_frame_axes(frame_name, axes_length=0.3)
 
     lock  = threading.Lock()
     state: dict = {
@@ -285,7 +287,9 @@ def main() -> None:
                                    initial_value=0)
     play_btn  = srv.gui.add_button("\u25b6  Play")
     reset_btn = srv.gui.add_button("\u27f3  Reset")
-    ekf_chk   = srv.gui.add_checkbox("Show EKF estimate", initial_value=True)
+    ekf_chk         = srv.gui.add_checkbox("Show EKF estimate",  initial_value=True)
+    world_frame_chk = srv.gui.add_checkbox("Show world frame",   initial_value=True)
+    body_frame_chk  = srv.gui.add_checkbox("Show body frame",    initial_value=True)
     speed_inp = srv.gui.add_number("Speed \xd7", initial_value=1.0,
                                    min=0.1, max=100.0, step=0.1)
 
@@ -313,6 +317,14 @@ def main() -> None:
             ep = state["est_pos"].astype(np.float32)
         color = (255, 80, 0) if ekf_chk.value else (0, 0, 0)
         _push_cloud(srv, "filtered_traj", ep, color, 0.02)
+
+    @world_frame_chk.on_update
+    def _on_world_frame_toggle(event: viser.GuiEvent) -> None:
+        world_frame_hdl.visible = world_frame_chk.value
+
+    @body_frame_chk.on_update
+    def _on_body_frame_toggle(event: viser.GuiEvent) -> None:
+        body_frame_hdl.visible = body_frame_chk.value
 
     # ---- Initial pose & event loop ---------------------------------------
     _set_frame(0)
