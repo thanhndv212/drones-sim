@@ -199,10 +199,10 @@ $$
 **Benefit:** The controller can be simplified to a pure flatness-based feed-forward with feedback
 linearization, removing the need for nested PID loops.
 
-### 5.2 Minimum-Snap Polynomial Trajectories
+### 5.2 Minimum-Snap Polynomial Trajectories — ✅ Implemented (commit `8fdef56`)
 
 For a sequence of waypoints $\mathbf{w}_0, \ldots, \mathbf{w}_M$ with times $t_0, \ldots, t_M$,
-find piecewise polynomial $p_i(t)$ of degree $n$ that minimizes:
+find piecewise polynomial $p_i(t)$ of degree $n \geq 7$ that minimizes:
 
 $$
 J = \int_0^{t_M} \left\|\frac{d^4\mathbf{p}}{dt^4}\right\|^2 dt
@@ -211,16 +211,38 @@ $$
 Subject to:
 - $p_i(t_i) = \mathbf{w}_i$, $p_i(t_{i+1}) = \mathbf{w}_{i+1}$
 - $C^3$ continuity at interior waypoints (velocity, acceleration, jerk match)
-- Optional: obstacle clearance constraints
+- Zero velocity, acceleration, and jerk at the first and last waypoint
 
-This leads to a **Quadratic Program (QP)**:
+This leads to a **Quadratic Program (QP)** solved via the bordered KKT system:
 
 $$
 J = \mathbf{c}^T Q \mathbf{c}, \quad \text{s.t.} \quad A_\text{eq}\mathbf{c} = \mathbf{b}_\text{eq}
 $$
 
-**Implementation plan:** Add `generate_minimum_snap(waypoints, times, order=7)` in `trajectory.py`;
-use `scipy.linalg.lstsq` or `osqp` for small instances.
+$$
+\begin{bmatrix} Q & A^T \\ A & 0 \end{bmatrix}
+\begin{bmatrix} \mathbf{c} \\ \boldsymbol\lambda \end{bmatrix}
+=
+\begin{bmatrix} \mathbf{0} \\ \mathbf{b} \end{bmatrix}
+$$
+
+Solved per axis with `scipy.linalg.lstsq`.
+
+**Usage:**
+```python
+from drones_sim.trajectory import generate_minimum_snap
+
+traj = generate_minimum_snap(
+    waypoints=[(0,0,0), (1,0,1), (2,1,2)],
+    times=[0.0, 3.0, 6.0],   # optional; auto-allocated from distances if None
+    order=7,                  # polynomial degree per segment (must be >= 7)
+    dt=0.01,
+)
+# traj.position, traj.velocity, traj.acceleration are C³-continuous
+```
+
+Time allocation when `times=None`: proportional to Euclidean inter-waypoint distances.
+Tests in `tests/test_trajectory.py`.
 
 ### 5.3 Time Allocation
 
@@ -275,9 +297,10 @@ Build kinematic limits directly into trajectory generation:
 |---------|-------------|---------|
 | [examples/01_imu_ekf_basic.py](../examples/01_imu_ekf_basic.py) | Pre-generated | `generate_hover_accel_cruise` as sensor test input |
 | [examples/02_ekf_adaptive.py](../examples/02_ekf_adaptive.py) | Pre-generated | Same trajectory, temperature-enabled |
-| [examples/03_waypoint_nav.py](../examples/03_waypoint_nav.py) | Online | Waypoint list targeted at runtime; feed-forward from previous target |
-| [examples/04_viser_viewer.py](../examples/04_viser_viewer.py) | Online | Same as 03 + 3D interactive playback |
-| [examples/05_full_pipeline.py](../examples/05_full_pipeline.py) | Online | Waypoint targeting with estimator feedback |
+| [examples/03_waypoint_nav.py](../examples/03_waypoint_nav.py) | Min-snap | `generate_minimum_snap` — C³-continuous reference from waypoints |
+| [examples/04_viser_viewer.py](../examples/04_viser_viewer.py) | Online | Waypoint list targeted at runtime + 3D interactive playback |
+| [examples/05_full_pipeline.py](../examples/05_full_pipeline.py) | Online | Waypoint targeting with EKF feedback |
+| [examples/06_trajectory_following.py](../examples/06_trajectory_following.py) | Pre-generated | `generate_circular` — full pipeline 3-D trajectory tracking |
 
 ---
 

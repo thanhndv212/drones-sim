@@ -165,7 +165,39 @@ The $3\times10$ Jacobian $H_\text{mag}$ mirrors $H_\text{accel}$ structure for t
 
 ✅ **Implemented in:** `ExtendedKalmanFilter.correct_mag(mag)`, `_mag_jacobian(q)`
 
-### 3.5 Noise Parameters
+### 3.5 Position (GPS) Correction
+
+A position measurement from GPS is modelled as:
+
+$$
+\mathbf{z}_\text{GPS} = \mathbf{p} + \boldsymbol\eta_\text{GPS}
+$$
+
+Measurement model: $h_\text{GPS}(\mathbf{x}) = \mathbf{p}$, Jacobian: $H_\text{GPS} = [I_3\; 0_{3\times7}]$.
+
+Standard EKF update with $R_\text{GPS} = \sigma_p^2 I_3$ (e.g. $\sigma_p = 0.5$ m → $R = 0.25 I$).
+
+✅ **Implemented in:** `ExtendedKalmanFilter.correct_position(pos_meas, R_pos)` (commit `10448dd`)
+
+Typical usage (10 Hz GPS update in a 100 Hz loop):
+```python
+if i % 10 == 0:
+    gps_pos, _, gps_valid = gps.step(true_pos, true_vel)
+    if gps_valid:
+        ekf.correct_position(gps_pos, R_pos=np.eye(3) * 0.25)
+```
+
+### 3.6 Altitude Correction (Barometer)
+
+Barometer gives a scalar altitude measurement:
+
+$$
+z_\text{baro} = p_z + \eta_\text{baro}
+$$
+
+✅ **Implemented in:** `ExtendedKalmanFilter.correct_altitude(z_baro, r_z)` — existing before this sprint.
+
+### 3.7 Noise Parameters
 
 | Parameter | Default value | Meaning |
 |-----------|--------------|---------|
@@ -344,7 +376,7 @@ The estimator bridges the Euler-angle plant and quaternion-based orientation com
 | Maximum accuracy; analytical Jacobians available | `ExtendedKalmanFilter` |
 | High-rate inner attitude loop; CPU constrained | `AHRS` alone |
 | Moderate accuracy + adaptive noise; full position estimate | `AdaptiveEKF` + `AHRS` |
-| Future: GPS fusion, position correction | `ExtendedKalmanFilter` (add position update step) |
+| GPS fusion, full-pipeline trajectory tracking | `ExtendedKalmanFilter` + `correct_position()` ✅ |
 
 ---
 
@@ -354,7 +386,8 @@ The estimator bridges the Euler-angle plant and quaternion-based orientation com
 |---------|------|------------------------|
 | [examples/01_imu_ekf_basic.py](../examples/01_imu_ekf_basic.py) | `ExtendedKalmanFilter` | Predict-correct loop on generated trajectory |
 | [examples/02_ekf_adaptive.py](../examples/02_ekf_adaptive.py) | `AdaptiveEKF` + `AHRS` | Adaptive estimation under temperature-dependent noise |
-| [examples/05_full_pipeline.py](../examples/05_full_pipeline.py) | `AdaptiveEKF` + `AHRS` | Estimated state fed to controller (not truth state) |
+| [examples/05_full_pipeline.py](../examples/05_full_pipeline.py) | `ExtendedKalmanFilter` | IMU + baro + GPS fusion; estimated state alongside true state |
+| [examples/06_trajectory_following.py](../examples/06_trajectory_following.py) | `ExtendedKalmanFilter` | Same fusion stack on circular trajectory |
 
 | Test | File | What is checked |
 |------|------|----------------|
@@ -365,17 +398,19 @@ The estimator bridges the Euler-angle plant and quaternion-based orientation com
 
 ## 9. Planned Extensions
 
-### 9.1 GPS Measurement Update
+### 9.1 GPS Measurement Update — ✅ Implemented (commit `10448dd`)
 
-Add a position measurement model:
+Position measurement model:
 
 $$
 h_\text{GPS}(\mathbf{x}) = \mathbf{p},\quad H_\text{GPS} = [I_3\; 0_{3\times7}]
 $$
 
-Measurement noise $R_\text{GPS} \approx \text{diag}(1, 1, 2)$ m² (typical consumer GPS).
+Measurement noise $R_\text{GPS} \approx \text{diag}(0.25, 0.25, 0.25)$ m² for $\sigma = 0.5$ m GPS.
 
-**Implementation plan:** Add `correct_gps(pos_meas)` to `ExtendedKalmanFilter`.
+`ExtendedKalmanFilter.correct_position(pos_meas, R_pos)` performs the standard EKF update with
+anomaly protection (covariance symmetrization after update). Pairs with `GPSSimulator.step()`
+for realistic noisy measurements.
 
 ### 9.2 Innovation Gating (Outlier Rejection)
 

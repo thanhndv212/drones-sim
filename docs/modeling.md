@@ -308,7 +308,7 @@ $$
 
 ⚠️ **Limitation:** Forward Euler is first-order accurate and can become unstable for stiff dynamics or large $\Delta t$.
 
-🗺️ **Planned:** Upgrade to 4th-order Runge-Kutta (RK4):
+✅ **Implemented:** Upgrade to 4th-order Runge-Kutta (RK4):
 
 $$
 \begin{aligned}
@@ -327,9 +327,9 @@ $$
 | Limitation | Impact | Status |
 |-----------|--------|--------|
 | Euler attitude (gimbal lock near $\theta = \pm90°$) | Singularity in kinematic transform $W$ | ⚠️ Known |
-| Forward Euler integration | Numerical drift at large $\Delta t$ | ⚠️ Low priority |
+| Forward Euler integration | Numerical drift at large $\Delta t$ | ✅ Solved |
 | Linear drag only $(-k_d \mathbf{v})$ | Under-estimates drag at high speed | ⚠️ Known |
-| Instant motor response | Ignores actuator bandwidth | ⚠️ Known |
+| Instant motor response | Ignores actuator bandwidth | ✅ Implemented (1st-order lag) |
 | No wind model | Cannot test disturbance rejection | 🗺️ Roadmap |
 
 ---
@@ -337,6 +337,8 @@ $$
 ## 9. Planned Extensions
 
 ### 9.1 Motor Dynamics (First-Order Lag)
+
+✅ **Implemented** (commit `f108740`)
 
 Real rotors do not follow commands instantaneously. A first-order lag model:
 
@@ -352,8 +354,21 @@ $$
 
 Typical $\tau_m$: 30–80 ms for small UAVs.
 
-**Implementation plan:** Add `motor_states: NDArray` (shape 4) to `QuadcopterDynamics.__init__` and integrate them
-alongside the plant state in `update()`.
+**Implementation:**
+```python
+# QuadcopterDynamics.__init__
+motor_time_constant: float = 0.0   # 0 = disabled (backward-compatible)
+motor_states: NDArray              # actual rotor speeds after lag, shape (4,)
+
+# update() applies lag first, then RK4 on plant
+if self.motor_time_constant > 0:
+    alpha = dt / self.motor_time_constant
+    self.motor_states += alpha * (motor_speeds - self.motor_states)
+else:
+    self.motor_states = motor_speeds.copy()
+```
+
+Access actual rotor speeds via `quad.get_motor_speeds()`. Tests in `tests/test_dynamics.py`.
 
 ### 9.2 Wind and Turbulence (Dryden Model)
 

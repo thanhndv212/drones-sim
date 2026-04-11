@@ -11,9 +11,9 @@ The sensor simulation layer converts ground-truth trajectory data into realistic
 measurements that feed the state estimators. It models the key corruptions present in real MEMS
 sensors: Gaussian noise, constant bias, scale-factor errors, and optional temperature drift.
 
-**Current sensor types:** IMU (accelerometer + gyroscope + magnetometer).
+**Current sensor types:** IMU (accelerometer + gyroscope + magnetometer), GPS.
 
-**Planned additions:** GPS, barometer, optical flow, rangefinder (see Section 8).
+**Planned additions:** barometer (✅ used inline), optical flow, rangefinder (see Section 8).
 
 ---
 
@@ -30,7 +30,7 @@ $$
 where:
 
 - $x_k$: true physical quantity (acceleration, angular rate, or magnetic field)
-- $s_i \sim \mathcal{U}(s_\min, s_\max)$: per-axis scale factor (randomized at construction)
+- $s_i \sim \mathcal{U}(s_\text{min}, s_\text{max})$: per-axis scale factor (randomized at construction)
 - $b_i \sim \mathcal{U}(-b_\text{range}, b_\text{range})$: per-axis constant bias (randomized at construction)
 - $\eta_k \sim \mathcal{N}(0,\; \sigma^2 \cdot \gamma(T)^2)$: temperature-scaled Gaussian noise
 
@@ -76,6 +76,8 @@ class SensorNoiseModel:
     noise_std: float           # σ for Gaussian noise
     bias_range: float          # bias drawn from U(-range, +range)
     scale_factor_range: tuple  # scale drawn from U(lo, hi)
+    bias_time_constant: float = float('inf')   # τ_b [s]; inf = constant bias
+    bias_random_walk_std: float = 0.0          # σ_b for Markov walk
     bias: NDArray              # (3,) — set in __post_init__
     scale_factor: NDArray      # (3,) — set in __post_init__
 ```
@@ -83,11 +85,18 @@ class SensorNoiseModel:
 ### 3.1 Apply Method
 
 ```python
-def apply(self, true_value: NDArray, temp_factor: float = 1.0) -> NDArray:
+def apply(self, true_value: NDArray, temp_factor: float = 1.0, dt: float | None = None) -> NDArray:
     noisy = true_value * self.scale_factor + self.bias
     noisy += np.random.normal(0, self.noise_std * temp_factor, 3)
+    # Gauss-Markov bias random walk (when dt provided and tau_b < inf)
+    if dt is not None and self.bias_time_constant < float('inf'):
+        phi = np.exp(-dt / self.bias_time_constant)
+        sigma = self.bias_random_walk_std * np.sqrt(1 - phi**2)
+        self.bias = phi * self.bias + sigma * np.random.normal(0, 1, self.bias.shape)
     return noisy
 ```
+
+`dt=None` preserves constant-bias behaviour (backward compatible).
 
 ### 3.2 Default Noise Parameters (from `IMUConfig`)
 
@@ -264,18 +273,18 @@ Practical multi-rate separation:
 
 | Limitation | Description |
 |-----------|-------------|
-| White noise only | Real IMUs have random walk and flicker noise (colored noise) |
-| Constant bias | Real sensors have slowly-varying bias (Gauss-Markov process) |
+| White noise only (base Gaussian) | Real IMUs have colored noise (flicker / random walk) |
+| Constant bias (default) | ✅ Gauss-Markov walk available via `bias_time_constant` + `bias_random_walk_std` |
 | Diagonal scale factor | Cross-axis coupling and misalignment not modeled |
 | No magnetometer distortion | Hard-iron / soft-iron distortions absent |
 | No fault injection | No dropout, stuck-at, or spike modes |
-| IMU only | No GPS, barometer, optical flow |
+| GPS only | No barometer simulator class, no optical flow |
 
 ---
 
-## 8. Planned Extensions
+## 8. Planned / Implemented Extensions
 
-### 8.1 Bias Random Walk (Gauss-Markov)
+### 8.1 Bias Random Walk (Gauss-Markov) — ✅ Implemented (commit `9a0bd48`)
 
 A more realistic bias model uses a first-order Gauss-Markov process:
 
@@ -289,10 +298,20 @@ $$
 b_{k+1} = e^{-\Delta t/\tau_b} b_k + \sigma_b \sqrt{1 - e^{-2\Delta t/\tau_b}}\, \eta_k
 $$
 
-Typical $\tau_b \approx 100$–$1000$ s for MEMS gyroscopes.
+Typical $\tau_b \approx 20$–$60$ s for MEMS devices (gyro > accel due to lower temperature sensitivity).
 
-**Implementation plan:** Replace static `bias` in `SensorNoiseModel` with a state variable updated
-in `apply()`.
+**Usage:**
+```python
+accel_noise = SensorNoiseModel(
+    noise_std=0.05, bias_range=0.1,
+    bias_time_constant=20.0,      # s
+    bias_random_walk_std=0.005,   # m/s²/√s
+)
+# Pass dt each step so the Markov recursion is driven forward:
+accel_meas = accel_noise.apply(true_accel, dt=dt)
+```
+
+`dt=None` keeps original constant-bias behaviour (backward-compatible).
 
 ### 8.2 Full Calibration Matrix
 
@@ -315,19 +334,30 @@ $$
 
 Standard calibration recovers $W^{-1}$ and $\mathbf{v}$ from an ellipsoid fit.
 
-### 8.4 GPS Simulator
+### 8.4 GPS Simulator — ✅ Implemented (commit `10448dd`)
 
 ```python
 @dataclass
 class GPSConfig:
-    position_noise_std: float = 1.0   # m (CEP)
+    position_noise_std: float = 1.0   # m (1-sigma, each axis)
     velocity_noise_std: float = 0.1   # m/s
     update_rate: float = 5.0          # Hz
     dropout_probability: float = 0.0
 
+@dataclass
+class GPSData:
+    t: NDArray          # GPS epoch timestamps (K,)
+    position: NDArray   # (K, 3) noisy position
+    velocity: NDArray   # (K, 3) noisy velocity
+    valid: NDArray      # (K,) bool — False on dropout epochs
+
 class GPSSimulator:
-    def simulate(self, traj: TrajectoryData) -> GPSData: ...
+    def simulate(self, traj: TrajectoryData) -> GPSData: ...   # batch
+    def step(self, true_position, true_velocity) -> tuple[NDArray, NDArray, bool]: ...
 ```
+
+`step()` is used in closed-loop simulations; `simulate()` for open-loop pre-generation.
+Imported from `drones_sim.sensors`. Tests in `tests/test_gps.py`.
 
 ### 8.5 Barometer Simulator
 
@@ -356,7 +386,13 @@ Add a `FaultMode` enum to `IMUConfig`:
 |---------|----------------------|
 | [examples/01_imu_ekf_basic.py](../examples/01_imu_ekf_basic.py) | `IMUSimulator` → `ExtendedKalmanFilter` basic loop |
 | [examples/02_ekf_adaptive.py](../examples/02_ekf_adaptive.py) | `enable_temperature=True` → `AdaptiveEKF` noise adaptation |
-| [examples/05_full_pipeline.py](../examples/05_full_pipeline.py) | `SensorNoiseModel` applied inline in closed-loop |
+| [examples/05_full_pipeline.py](../examples/05_full_pipeline.py) | `SensorNoiseModel` (Gauss-Markov bias) + `GPSSimulator` closed-loop |
+| [examples/06_trajectory_following.py](../examples/06_trajectory_following.py) | Same sensor stack with circular trajectory reference |
+
+| Test | File | What is checked |
+|------|------|----------------|
+| Gauss-Markov drift | [tests/test_sensor_models.py](../tests/test_sensor_models.py) | Bias walks over time when `dt` provided; constant when `dt=None` |
+| GPS position noise | [tests/test_gps.py](../tests/test_gps.py) | Noise magnitude, update rate, dropout flag, step() |
 
 ---
 

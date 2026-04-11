@@ -1,7 +1,8 @@
 # Control
 
 **Implementation:** [src/drones_sim/control/pid.py](../src/drones_sim/control/pid.py),
-[src/drones_sim/control/cascaded.py](../src/drones_sim/control/cascaded.py)
+[src/drones_sim/control/cascaded.py](../src/drones_sim/control/cascaded.py),
+[src/drones_sim/control/lqr.py](../src/drones_sim/control/lqr.py)
 
 ---
 
@@ -65,13 +66,13 @@ $$
 Integral term is clamped element-wise:
 
 $$
-I_k \leftarrow \text{clip}(I_k,\; I_\min,\; I_\max)
+I_k \leftarrow \text{clip}(I_k,\; I_\text{min},\; I_\text{max})
 $$
 
 Output is saturated:
 
 $$
-u_k \leftarrow \text{clip}(u_k,\; u_\min,\; u_\max)
+u_k \leftarrow \text{clip}(u_k,\; u_\text{min},\; u_\text{max})
 $$
 
 ### 2.3 Constructor Parameters
@@ -140,7 +141,7 @@ $$
 Feed-forward from target position derivative (when `prev_target_pos` is provided):
 
 $$
-\mathbf{v}_\text{ff} = \text{clip}\!\left(\frac{\mathbf{p}_d^k - \mathbf{p}_d^{k-1}}{\Delta t},\; \pm v_\max\right)
+\mathbf{v}_\text{ff} = \text{clip}\!\left(\frac{\mathbf{p}_d^k - \mathbf{p}_d^{k-1}}{\Delta t},\; \pm v_\text{max}\right)
 $$
 
 Blended with gains $[0.25, 0.25, 0.15]$:
@@ -167,12 +168,12 @@ $$
 For small angles, lateral acceleration ↔ attitude angle via gravitational coupling:
 
 $$
-\theta_d = \text{clip}\!\left(\frac{a_{x,\text{des}}}{g},\; -\theta_\max,\; \theta_\max\right)
+\theta_d = \text{clip}\!\left(\frac{a_{x,\text{des}}}{g},\; -\theta_\text{max},\; \theta_\text{max}\right)
 \quad \text{(pitch)}
 $$
 
 $$
-\phi_d = \text{clip}\!\left(\frac{-a_{y,\text{des}}}{g},\; -\phi_\max,\; \phi_\max\right)
+\phi_d = \text{clip}\!\left(\frac{-a_{y,\text{des}}}{g},\; -\phi_\text{max},\; \phi_\text{max}\right)
 \quad \text{(roll)}
 $$
 
@@ -184,7 +185,7 @@ $$
 T = \frac{m(g + a_{z,\text{des}})}{\max(\cos\phi \cos\theta,\; 0.7)}
 $$
 
-Clamped to $[T_\min, T_\max] = [0.2mg,\; 2.0mg]$.
+Clamped to $[T_\text{min}, T_\text{max}] = [0.2mg,\; 2.0mg]$.
 
 The cosine correction compensates for the reduced vertical component of thrust when tilted. The floor of 0.7 prevents division by tiny values at extreme tilt.
 
@@ -220,7 +221,7 @@ $$
 Motor speeds:
 
 $$
-\omega_i = \sqrt{\max(\omega_i^2, 0)}, \quad \omega_i \leftarrow \text{clip}(\omega_i, 0, \omega_\max)
+\omega_i = \sqrt{\max(\omega_i^2, 0)}, \quad \omega_i \leftarrow \text{clip}(\omega_i, 0, \omega_\text{max})
 $$
 
 If $A$ is singular (unlikely for X-config), the controller falls back to hover speed:
@@ -243,7 +244,7 @@ Strength: simple, robust, tunable. Best for: attitude, altitude, position hold.
 
 Weakness: no constraint handling; gains are fixed; performance degrades with large model error.
 
-### 5.2 Linear Quadratic Regulator (LQR) — 🗺️ Planned
+### 5.2 Linear Quadratic Regulator (LQR) — ✅ Implemented (commit `50a8cc0`)
 
 **Law:** $\mathbf{u} = -K\mathbf{x}$, where $K = R^{-1}B^T P$ and $P$ satisfies the **Algebraic Riccati
 Equation (ARE)**:
@@ -256,17 +257,34 @@ $$
 - $R$: input penalty matrix (penalizes control effort)
 - $P$: positive-definite solution determining optimal gain
 
-With the plant linearized at hover:
+The plant is linearized at hover ($\phi=\theta=0$, $T=mg$). The resulting $A \in \mathbb{R}^{12\times12}$,
+$B \in \mathbb{R}^{12\times4}$ matrices have simple structure: translational and rotational channels
+decouple. Gain $K$ is computed once offline with `scipy.linalg.solve_continuous_are(A, B, Q, R)`.
 
-$$
-\dot{\mathbf{x}} = A\mathbf{x} + B\mathbf{u}
-$$
+**Interface** (same as `QuadcopterController`):
 
-Compute $K$ offline with `scipy.linalg.solve_continuous_are(A, B, Q, R)`.
+```python
+lqr = LQRController(quad)           # computes K at construction
+motors = lqr.compute(target_pos, target_yaw, dt, prev_target_pos)
+```
 
-**Best for:** optimal local stabilization; attitude and altitude regulation; replacing the inner PID loops.
+**Default weights:**
 
-**Limitation:** only optimal at the linearization point; no explicit constraint satisfaction.
+| State group | Q diagonal | R diagonal |
+|-------------|-----------|------------|
+| Position x, y, z | 10, 10, 12 | — |
+| Velocity vx, vy, vz | 2, 2, 4 | — |
+| Attitude φ, θ, ψ | 5, 5, 3 | — |
+| Body rate p, q, r | 0.5, 0.5, 0.3 | — |
+| Thrust T | — | 0.01 |
+| Torques τφ, τθ, τψ | — | 50, 50, 20 |
+
+**Strength:** optimal local stabilization; no integrator windup; single-gain matrix easy to tune.
+
+**Limitation:** only optimal at the linearization point (hover); no explicit constraint satisfaction;
+performance degrades at large departure from hover (strong nonlinearity).
+
+**Implemented in:** `LQRController` (`control/lqr.py`). Tests in `tests/test_lqr.py`.
 
 ### 5.3 Model Predictive Control (MPC) — 🗺️ Planned
 
@@ -327,7 +345,7 @@ $$
 | Controller | Attitude | Altitude | Position | Trajectory | Constraints | Adaptation |
 |------------|----------|----------|----------|------------|-------------|------------|
 | PID ✅ | ✅ | ✅ | ✅ | — | — | — |
-| LQR 🗺️ | ✅ | — | ✅ | ✅ | — | — |
+| LQR ✅ | ✅ | — | ✅ | ✅ | — | — |
 | MPC 🗺️ | — | — | ✅ | ✅ | ✅ | — |
 | Adaptive 🗺️ | — | ✅ | — | — | — | ✅ |
 | SMC 🗺️ | ✅ | — | — | — | — | ✅ |
