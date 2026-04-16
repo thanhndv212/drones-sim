@@ -75,6 +75,7 @@ All state and measurement arrays are pre-allocated for efficiency.
 | [examples/03_waypoint_nav.py](../examples/03_waypoint_nav.py) | Closed-loop | Online waypoint targeting; cascaded PID; position+attitude plots |
 | [examples/04_viser_viewer.py](../examples/04_viser_viewer.py) | Closed-loop + 3D | Same as 03 + interactive viser playback; true vs filtered path overlay |
 | [examples/05_full_pipeline.py](../examples/05_full_pipeline.py) | Full pipeline | Dynamics + noisy sensors + EKF estimation + cascaded PID feedback loop |
+| [examples/06_trajectory_following.py](../examples/06_trajectory_following.py) | Closed-loop + 3D | EKF-fused trajectory following on `generate_circular()`; interactive viser GUI with random trajectory button, EKF toggle, and 4-panel tracking-error plot |
 
 ### 3.1 Minimal Loop Pattern (from 05_full_pipeline.py)
 
@@ -198,7 +199,7 @@ instability or divergence.
 | Metric | Interpretation |
 |--------|---------------|
 | Motor speed variance | High variance → aggressive / unsmooth control |
-| Motor saturation ratio | Fraction of time motors hit $\omega_\max$ |
+| Motor saturation ratio | Fraction of time motors hit $\omega_\text{max}$ |
 | $\sum u_k^T R u_k$ | LQR-style cost for benchmarking controllers |
 
 ---
