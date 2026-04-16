@@ -115,6 +115,64 @@ class DroneViewer:
 
         return frame_name
 
+    def add_quadcopter_urdf(
+        self,
+        name: str = "quad_urdf",
+        urdf_model=None,
+    ) -> str:
+        """Create a quadcopter body-frame group from a parsed URDF model.
+
+        Each URDF link is rendered as a mesh (box/cylinder/sphere) using
+        ``server.scene.add_mesh_simple``.  All meshes are parented under a
+        ``/robot/{name}`` frame so a single call to
+        :meth:`update_quadcopter_pose` moves the whole assembly.
+
+        Parameters
+        ----------
+        name:
+            scene-graph name for the root frame.
+        urdf_model:
+            :class:`~drones_sim.models.DroneURDFModel` instance.  When *None*
+            the bundled quadcopter URDF is loaded automatically.
+
+        Returns
+        -------
+        str
+            The root frame path (pass to :meth:`update_quadcopter_pose`).
+        """
+        from drones_sim.models import load_drone_urdf
+        from drones_sim.models.urdf_loader import geometry_to_mesh
+
+        if urdf_model is None:
+            urdf_model = load_drone_urdf()
+
+        frame_name = f"/robot/{name}"
+
+        for link in urdf_model.links:
+            if link.visual is None:
+                continue
+
+            # World-frame offset of this link origin (translation only, fixed joints)
+            link_pos = urdf_model.link_world_position(link.name)
+
+            # Build mesh in link-local frame then offset by link_pos
+            verts, faces = geometry_to_mesh(link.visual)
+            verts = verts + link_pos.astype(np.float32)
+
+            color_uint8 = tuple(int(c * 255) for c in link.color_rgba[:3])
+
+            self.server.scene.add_mesh_simple(
+                f"{frame_name}/{link.name}",
+                vertices=verts,
+                faces=faces,
+                color=color_uint8,
+                wxyz=(1.0, 0.0, 0.0, 0.0),
+                position=(0.0, 0.0, 0.0),
+                flat_shading=False,
+            )
+
+        return frame_name
+
     def add_world_frame(self, axes_length: float = 0.6) -> object:
         """Add a static world-frame axes indicator at the origin.
 
@@ -189,6 +247,7 @@ class DroneViewer:
         filtered_positions: NDArray | None = None,
         waypoints: list[tuple[float, float, float]] | None = None,
         reference_positions: NDArray | None = None,
+        urdf_model=None,
     ) -> None:
         """Launch interactive playback with a time slider in the GUI.
 
@@ -196,6 +255,9 @@ class DroneViewer:
             reference_positions: If provided, a (N, 3) array of desired positions.
                 A live tracking-error plot (‖actual − reference‖) is shown in
                 the GUI panel and updates with every frame.
+            urdf_model: Optional :class:`~drones_sim.models.DroneURDFModel`.
+                When provided the drone body is rendered as a URDF mesh instead
+                of the default icosphere representation.
 
         This blocks and serves the viewer until the user stops it.
         """
@@ -217,7 +279,10 @@ class DroneViewer:
                 color=(50, 220, 80),
             )
 
-        frame_name = self.add_quadcopter_frame()
+        if urdf_model is not None:
+            frame_name = self.add_quadcopter_urdf("quad", urdf_model)
+        else:
+            frame_name = self.add_quadcopter_frame()
 
         # Simulation time step (seconds per frame) — base value derived from data
         _dt_base = float(t[1] - t[0]) if len(t) > 1 else 0.05
