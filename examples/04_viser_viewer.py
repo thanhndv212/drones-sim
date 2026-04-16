@@ -11,9 +11,14 @@ from drones_sim.dynamics import QuadcopterDynamics
 from drones_sim.control import QuadcopterController
 from drones_sim.math_utils import euler_to_rotation_matrix
 from drones_sim.visualization.viewer import DroneViewer
+from drones_sim.models import load_drone_urdf
 
 
 def main():
+    # Load URDF model for 3D display
+    urdf_model = load_drone_urdf()
+    print(urdf_model)
+
     # Run simulation
     quad = QuadcopterDynamics()
     ctrl = QuadcopterController(quad)
@@ -60,7 +65,7 @@ def main():
         targets_log[i] = target
         prev_target = target.copy()
 
-    # Launch viewer
+    # Launch viewer with URDF mesh drone
     viewer = DroneViewer(port=8080)
     viewer.playback(
         t,
@@ -68,6 +73,7 @@ def main():
         rotations,
         waypoints=waypoints,
         reference_positions=targets_log,
+        urdf_model=urdf_model,
     )
 
 

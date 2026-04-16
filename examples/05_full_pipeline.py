@@ -24,6 +24,7 @@ from drones_sim.math_utils import (
     quat_to_rotation_matrix,
 )
 from drones_sim.visualization.viewer import DroneViewer
+from drones_sim.models import load_drone_urdf
 
 
 def main():
@@ -246,6 +247,8 @@ def main():
     print(f"Mean estimation error: {np.linalg.norm(true_pos - est_pos, axis=1).mean():.4f}m")
 
     # --- 3D Viewer ---
+    urdf_model = load_drone_urdf()
+    print(urdf_model)
     viewer = DroneViewer(port=8080)
     viewer.playback(
         t,
@@ -253,6 +256,7 @@ def main():
         rotations,
         filtered_positions=est_pos,
         reference_positions=targets_log,
+        urdf_model=urdf_model,
     )
 
 

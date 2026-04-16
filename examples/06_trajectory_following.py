@@ -37,6 +37,7 @@ from drones_sim.estimation import ExtendedKalmanFilter
 from drones_sim.trajectory import generate_circular, generate_minimum_snap
 from drones_sim.math_utils import euler_to_rotation_matrix
 from drones_sim.visualization.viewer import DroneViewer
+from drones_sim.models import load_drone_urdf
 
 # ---------------------------------------------------------------------------
 # Module-level constants
@@ -179,7 +180,7 @@ def _make_random_traj(rng: np.random.Generator | None = None):
 # ---------------------------------------------------------------------------
 
 def _push_cloud(server, name: str, arr: np.ndarray,
-                color: tuple, size: float = 0.02) -> None:
+                color: tuple, size: float = 0.002) -> None:
     p = arr.astype(np.float32)
     c = np.tile(np.array(color, dtype=np.uint8), (len(p), 1))
     server.scene.add_point_cloud(f"/{name}", points=p, colors=c, point_size=size)
@@ -211,10 +212,14 @@ def main() -> None:
     viewer = DroneViewer(port=8081)
     srv    = viewer.server
 
-    _push_cloud(srv, "ref_traj",      traj.position, (50, 220, 80),  0.03)
-    _push_cloud(srv, "true_traj",     true_pos,      (0, 120, 255),  0.02)
-    _push_cloud(srv, "filtered_traj", est_pos,       (255, 80, 0),   0.02)
-    frame_name       = viewer.add_quadcopter_frame()
+    # Load URDF for 3D drone mesh display
+    urdf_model = load_drone_urdf()
+    print(urdf_model)
+
+    _push_cloud(srv, "ref_traj",      traj.position, (50, 220, 80),  0.002)
+    _push_cloud(srv, "true_traj",     true_pos,      (0, 120, 255),  0.002)
+    _push_cloud(srv, "filtered_traj", est_pos,       (255, 80, 0),   0.002)
+    frame_name       = viewer.add_quadcopter_urdf("quad", urdf_model)
     world_frame_hdl  = viewer.add_world_frame(axes_length=0.6)
     body_frame_hdl   = viewer.add_body_frame_axes(frame_name, axes_length=0.3)
 
@@ -250,7 +255,7 @@ def main() -> None:
             return
         with lock:
             state["traj"] = new_traj
-        _push_cloud(srv, "ref_traj", new_traj.position, (50, 220, 80), 0.03)
+        _push_cloud(srv, "ref_traj", new_traj.position, (50, 220, 80), 0.002)
         status_md.content = (
             f"**Status:** Random trajectory ready "
             f"({len(new_traj.t)} steps, {float(new_traj.t[-1]):.1f} s). "
@@ -274,8 +279,8 @@ def main() -> None:
             state["est_pos"]   = ep
             state["rotations"] = rots
             state["t"]         = new_t
-        _push_cloud(srv, "true_traj",     tp, (0, 120, 255), 0.02)
-        _push_cloud(srv, "filtered_traj", ep, (255, 80, 0),  0.02)
+        _push_cloud(srv, "true_traj",     tp, (0, 120, 255), 0.002)
+        _push_cloud(srv, "filtered_traj", ep, (255, 80, 0),  0.002)
         err_mean = float(np.linalg.norm(tp - traj_.position[:len(tp)], axis=1).mean())
         slider.max   = len(new_t) - 1
         slider.value = 0
@@ -316,7 +321,7 @@ def main() -> None:
         with lock:
             ep = state["est_pos"].astype(np.float32)
         color = (255, 80, 0) if ekf_chk.value else (0, 0, 0)
-        _push_cloud(srv, "filtered_traj", ep, color, 0.02)
+        _push_cloud(srv, "filtered_traj", ep, color, 0.002)
 
     @world_frame_chk.on_update
     def _on_world_frame_toggle(event: viser.GuiEvent) -> None:
