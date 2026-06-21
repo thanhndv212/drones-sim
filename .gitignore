@@ -50,4 +50,5 @@ MANIFEST
 # ruff
 .ruff_cache/
 training/checkpoints/
+configs/
 tb/
