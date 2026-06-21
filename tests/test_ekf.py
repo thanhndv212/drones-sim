@@ -4,8 +4,7 @@ import numpy as np
 import pytest
 
 from drones_sim.estimation.ekf import ExtendedKalmanFilter
-from drones_sim.math_utils import quat_to_rotation_matrix, quat_normalize
-
+from drones_sim.math_utils import quat_normalize, quat_to_rotation_matrix
 
 # ---------------------------------------------------------------------------
 # Helpers

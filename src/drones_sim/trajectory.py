@@ -6,13 +6,13 @@ acceleration, and (N, 4) for quaternion orientation [w,x,y,z].
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from math import factorial
-from typing import Literal
 
 import numpy as np
+from numpy.polynomial.polynomial import polyder
+from numpy.polynomial.polynomial import polyval as polyval1d
 from numpy.typing import NDArray
-from numpy.polynomial.polynomial import polyval as polyval1d, polyder
 from scipy.linalg import lstsq
 from scipy.spatial.transform import Rotation as R
 

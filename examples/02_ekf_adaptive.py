@@ -5,15 +5,15 @@ Uses the AHRS-aided adaptive EKF (9-state) with temperature-dependent
 sensor models.
 """
 
-import numpy as np
 import matplotlib.pyplot as plt
+import numpy as np
 
-from drones_sim.trajectory import generate_hover_accel_cruise
+from drones_sim.estimation.ekf import AdaptiveEKF
+from drones_sim.models import load_drone_urdf
 from drones_sim.sensors import IMUSimulator
 from drones_sim.sensors.imu import IMUConfig
-from drones_sim.estimation.ekf import AdaptiveEKF
+from drones_sim.trajectory import generate_hover_accel_cruise
 from drones_sim.visualization.plots import plot_ekf_results
-from drones_sim.models import load_drone_urdf
 
 
 def main():
@@ -21,7 +21,7 @@ def main():
     urdf_model = load_drone_urdf()
     print(urdf_model)
     print(f"  Total mass : {urdf_model.total_mass:.3f} kg")
-    print(f"  Links      : {[l.name for l in urdf_model.links]}")
+    print(f"  Links      : {[link.name for link in urdf_model.links]}")
     print(f"  Joints     : {[j.name for j in urdf_model.joints]}")
 
     # 1. Trajectory
@@ -62,7 +62,7 @@ def main():
         filt_quat[i] = state["quaternion"]
 
     # 4. Plot
-    fig = plot_ekf_results(
+    plot_ekf_results(
         traj.t,
         traj.position, traj.velocity, traj.orientation_quat,
         filt_pos, filt_vel, filt_quat,

@@ -6,8 +6,8 @@ import pytest
 from drones_sim.control import QuadcopterController
 from drones_sim.dynamics import QuadcopterDynamics
 from drones_sim.estimation import ExtendedKalmanFilter
-from drones_sim.sensors.models import SensorNoiseModel
 from drones_sim.math_utils import euler_to_rotation_matrix
+from drones_sim.sensors.models import SensorNoiseModel
 
 
 def _simulate_targets(
@@ -83,7 +83,7 @@ def test_ekf_position_error_bounded(seed):
     With GPS σ=0.5 m the theoretical floor is well below 2 m; a regression that
     re-introduces any of the six historical bugs will exceed this threshold.
     """
-    rng = np.random.default_rng(seed)
+    np.random.default_rng(seed)
     quad = QuadcopterDynamics()
     dt   = 0.01
     gravity = np.array([0.0, 0.0, 9.81])

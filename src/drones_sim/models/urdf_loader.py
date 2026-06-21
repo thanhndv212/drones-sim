@@ -15,7 +15,6 @@ from pathlib import Path
 import numpy as np
 from numpy.typing import NDArray
 
-
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
@@ -83,7 +82,7 @@ class DroneURDFModel:
     total_inertia: NDArray = field(default_factory=lambda: np.zeros((3, 3)))
 
     def __repr__(self) -> str:
-        link_names = [l.name for l in self.links]
+        link_names = [link.name for link in self.links]
         return (
             f"DroneURDFModel(name={self.name!r}, "
             f"links={link_names}, "
@@ -275,8 +274,8 @@ def load_drone_urdf(urdf_path: str | Path | None = None) -> DroneURDFModel:
         model.joints.append(joint)
 
     # --- aggregates ---
-    model.total_mass = sum(l.mass for l in model.links)
-    model.total_inertia = sum(l.inertia for l in model.links)  # type: ignore[assignment]
+    model.total_mass = sum(link.mass for link in model.links)
+    model.total_inertia = sum(link.inertia for link in model.links)  # type: ignore[assignment]
 
     return model
 

@@ -46,3 +46,6 @@ MANIFEST
 
 # Jupyter
 .ipynb_checkpoints/
+
+# ruff
+.ruff_cache/

@@ -295,8 +295,9 @@ class DroneViewer:
         if reference_positions is not None:
             _errors = np.linalg.norm(positions - reference_positions, axis=1)
             import io
-            import matplotlib.figure
+
             import matplotlib.backends.backend_agg as _agg
+            import matplotlib.figure
 
             def _render_error_plot(idx: int) -> NDArray:
                 fig = matplotlib.figure.Figure(figsize=(4, 1.9))

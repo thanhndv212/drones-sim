@@ -1,7 +1,6 @@
 """Tests for quadcopter dynamics."""
 
 import numpy as np
-import pytest
 
 from drones_sim.dynamics import QuadcopterDynamics
 

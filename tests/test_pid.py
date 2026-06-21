@@ -1,7 +1,6 @@
 """Tests for PID controller."""
 
 import numpy as np
-import pytest
 
 from drones_sim.control.pid import PIDController
 

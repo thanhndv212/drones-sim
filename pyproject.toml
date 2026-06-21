@@ -20,5 +20,20 @@ dev = ["pytest>=7.0", "ruff"]
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "tests", "examples"]
+extend-exclude = [".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP"]
+ignore = ["E501"]   # long lines — not worth a mass reformat
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = ["slow: marks tests as slow (deselect with '-m \"not slow\"')"]
+
 [tool.setuptools.package-data]
 "drones_sim.models" = ["*.urdf"]

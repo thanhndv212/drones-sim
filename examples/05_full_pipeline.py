@@ -10,21 +10,21 @@ This is the key integration example that wires together:
 """
 
 import os
-import numpy as np
-import matplotlib.pyplot as plt
 
-from drones_sim.dynamics import QuadcopterDynamics
+import matplotlib.pyplot as plt
+import numpy as np
+
 from drones_sim.control.pid import PIDController
-from drones_sim.sensors.models import SensorNoiseModel
-from drones_sim.sensors import GPSSimulator, GPSConfig
+from drones_sim.dynamics import QuadcopterDynamics
 from drones_sim.estimation import ExtendedKalmanFilter
 from drones_sim.math_utils import (
     euler_to_rotation_matrix,
-    quat_from_euler,
     quat_to_rotation_matrix,
 )
-from drones_sim.visualization.viewer import DroneViewer
 from drones_sim.models import load_drone_urdf
+from drones_sim.sensors import GPSConfig, GPSSimulator
+from drones_sim.sensors.models import SensorNoiseModel
+from drones_sim.visualization.viewer import DroneViewer
 
 
 def main():
@@ -107,7 +107,7 @@ def main():
         # Accelerometer measures specific force = R^T * (a_linear - g_world)
         # which in hover (a_linear ≈ 0) is just R^T * g (the reaction to gravity).
         # We approximate linear accel from the previous dynamics step.
-        lin_accel_world = np.array([0.0, 0.0, quad.g]) - np.array(
+        np.array([0.0, 0.0, quad.g]) - np.array(
             [0.0, 0.0, quad.g]
         )
         # Proper: rotate net force / mass back to body frame as specific force

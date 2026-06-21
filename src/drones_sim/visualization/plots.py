@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import matplotlib.pyplot as plt
 import numpy as np
 from numpy.typing import NDArray
-import matplotlib.pyplot as plt
 
 
 def plot_ekf_results(
@@ -32,8 +32,6 @@ def plot_ekf_results(
 
     labels = ["X", "Y", "Z"]
     colors = ["blue", "green", "red"]
-    styles_true = ["-", "-", "-"]
-    styles_filt = ["--", "--", "--"]
 
     # Position
     ax = axes[0, 0]
@@ -133,8 +131,8 @@ def plot_quadcopter_results(
 
     # Position vs time
     ax2 = fig.add_subplot(2, 3, 2)
-    for j, (c, l) in enumerate(zip(["r", "g", "b"], ["X", "Y", "Z"])):
-        ax2.plot(t, position[:, j], f"{c}-", label=l)
+    for j, (c, label) in enumerate(zip(["r", "g", "b"], ["X", "Y", "Z"])):
+        ax2.plot(t, position[:, j], f"{c}-", label=label)
         ax2.plot(t, target_position[:, j], f"{c}--", alpha=0.5)
     ax2.set_xlabel("Time (s)")
     ax2.set_ylabel("Position (m)")
@@ -144,8 +142,8 @@ def plot_quadcopter_results(
 
     # Attitude
     ax3 = fig.add_subplot(2, 3, 3)
-    for j, (c, l) in enumerate(zip(["r", "g", "b"], ["Roll", "Pitch", "Yaw"])):
-        ax3.plot(t, np.rad2deg(attitude[:, j]), f"{c}-", label=l)
+    for j, (c, label) in enumerate(zip(["r", "g", "b"], ["Roll", "Pitch", "Yaw"])):
+        ax3.plot(t, np.rad2deg(attitude[:, j]), f"{c}-", label=label)
     ax3.set_xlabel("Time (s)")
     ax3.set_ylabel("Angle (deg)")
     ax3.set_title("Attitude vs Time")
@@ -165,8 +163,8 @@ def plot_quadcopter_results(
     # Position error
     ax5 = fig.add_subplot(2, 3, 5)
     err = target_position - position
-    for j, (c, l) in enumerate(zip(["r", "g", "b"], ["X", "Y", "Z"])):
-        ax5.plot(t, err[:, j], f"{c}-", label=f"{l} Error")
+    for j, (c, label) in enumerate(zip(["r", "g", "b"], ["X", "Y", "Z"])):
+        ax5.plot(t, err[:, j], f"{c}-", label=f"{label} Error")
     ax5.set_xlabel("Time (s)")
     ax5.set_ylabel("Error (m)")
     ax5.set_title("Position Error vs Time")

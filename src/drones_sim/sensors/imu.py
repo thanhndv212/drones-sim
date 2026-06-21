@@ -7,7 +7,6 @@ imu_ekf_fusion_final.py, and imu_ekf_fusion_simplified.py.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
 
 import numpy as np
 from numpy.typing import NDArray
@@ -46,7 +45,7 @@ class IMUData:
     accel: NDArray          # (N, 3)
     gyro: NDArray           # (N, 3)
     mag: NDArray            # (N, 3)
-    temperature: Optional[NDArray] = None  # (N,) if temperature model enabled
+    temperature: NDArray | None = None  # (N,) if temperature model enabled
 
     # Ground-truth biases for validation
     accel_bias: NDArray = field(default_factory=lambda: np.zeros(3))

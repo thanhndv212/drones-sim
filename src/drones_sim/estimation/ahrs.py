@@ -9,7 +9,7 @@ from __future__ import annotations
 import numpy as np
 from numpy.typing import NDArray
 
-from ..math_utils import quat_normalize, quat_multiply, quat_to_rotation_matrix
+from ..math_utils import quat_normalize, quat_to_rotation_matrix
 
 
 class AHRS:
