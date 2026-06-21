@@ -11,7 +11,7 @@ import argparse
 
 import numpy as np
 
-from drones_sim.rl.actions import ThrustBodyRatesAction
+from drones_sim.rl.actions import ThrustBodyRatesAction, VelocityLevelAction, LQRResidualAction
 from drones_sim.rl.env import QuadcopterEnv
 from drones_sim.rl.observations import RelativeStateObs
 from drones_sim.rl.reward import RewardConfig, reward
@@ -23,66 +23,78 @@ def evaluate(
     n_episodes: int = 10,
     deterministic: bool = True,
     seed: int = 0,
+    action_type: str = "thrust_rates",
 ) -> dict:
     """Load a checkpoint and evaluate over *n_episodes*.
 
     Returns a dict with keys: pos_rmse, success_rate, crash_rate, mean_reward.
     """
+    import pickle as _pickle
+
     from stable_baselines3 import PPO
-    from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
-    env = QuadcopterEnv(
-        task=HoverTask(target=(0.0, 0.0, 2.0)),
-        action_param=ThrustBodyRatesAction(),
-        obs_builder=RelativeStateObs(),
-        reward_fn=reward,
-        reward_cfg=RewardConfig(),
-        dt=0.01, episode_len_s=10.0,
-    )
-    vec_env = DummyVecEnv([lambda: env])
-    vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=False, training=False)
+    # PPO with MlpPolicy is CPU-bound (tiny network + CPU env stepping).
+    device = "cpu"
 
+    if action_type == "velocity":
+        action_param = VelocityLevelAction()
+    elif action_type == "lqr_residual":
+        action_param = LQRResidualAction()
+    else:
+        action_param = ThrustBodyRatesAction()
+
+    # Load model and VecNormalize stats
+    model = PPO.load(model_path, device=device)
     import os
-
     stats_path = os.path.join(os.path.dirname(model_path), "vecnormalize.pkl")
+    vn_stats = None
     if os.path.exists(stats_path):
-        # SB3 VecNormalize saves stats as a .pkl; load with the same class
-        _vn = VecNormalize.load(stats_path, vec_env)
+        with open(stats_path, "rb") as f:
+            vn_stats = _pickle.load(f)
 
-    model = PPO.load(model_path, env=vec_env)
-
-    errors = []
-    successes = []
-    crashes = []
+    errors: list[float] = []
+    successes: list[bool] = []
+    crashes: list[bool] = []
     total_reward = 0.0
 
     for ep in range(n_episodes):
-        obs = vec_env.reset()
+        env = QuadcopterEnv(
+            task=HoverTask(target=(0.0, 0.0, 2.0)),
+            action_param=action_param,
+            obs_builder=RelativeStateObs(),
+            reward_fn=reward,
+            reward_cfg=RewardConfig(),
+            dt=0.01, episode_len_s=10.0,
+        )
+        obs, _ = env.reset()
         ep_reward = 0.0
         crashed = False
-        done = False
-        while not done:
-            action, _ = model.predict(obs, deterministic=deterministic)
-            obs, r, dones, infos = vec_env.step(action)
-            ep_reward += float(r[0])
-            if dones[0]:
-                crashed = True
-                done = True
-            # Also check env state
+        final_err = float("inf")
+
+        for _step in range(env.max_steps):
+            # Manual observation normalization
+            if vn_stats is not None:
+                obs_norm = (obs - vn_stats.obs_rms.mean) / np.sqrt(vn_stats.obs_rms.var + 1e-8)
+            else:
+                obs_norm = obs
+            action, _ = model.predict(obs_norm, deterministic=deterministic)
+            obs, r, terminated, truncated, info = env.step(action)
+            ep_reward += float(r)
+
             pos_err = float(np.linalg.norm(
                 env.task.target_pos(env.quad) - env.quad.get_position()
             ))
             errors.append(pos_err)
-            if env._step_idx >= env.max_steps:
-                done = True
-            if crashed:
+
+            if terminated:
+                crashed = True
+                break
+            if truncated:
                 break
 
+        # Final position is the last known position (no auto-reset ambiguity)
+        final_err = pos_err
         total_reward += ep_reward
-        # Success: no crash and final error < 0.2 m
-        final_err = float(np.linalg.norm(
-            env.task.target_pos(env.quad) - env.quad.get_position()
-        ))
         successes.append(not crashed and final_err < 0.2)
         crashes.append(crashed)
 
@@ -99,9 +111,13 @@ def main() -> None:
     parser.add_argument("--path", required=True, help="Path to model .zip file")
     parser.add_argument("--episodes", type=int, default=20)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--action-type", default="thrust_rates",
+                        choices=["thrust_rates", "velocity", "lqr_residual"],
+                        help="Action parameterization used during training")
     args = parser.parse_args()
 
-    results = evaluate(args.path, n_episodes=args.episodes, seed=args.seed)
+    results = evaluate(args.path, n_episodes=args.episodes, seed=args.seed,
+                       action_type=args.action_type)
     for k, v in results.items():
         print(f"{k:>15s}: {v:.4f}")
 

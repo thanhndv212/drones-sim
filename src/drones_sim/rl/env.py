@@ -113,21 +113,27 @@ class QuadcopterEnv(gym.Env if gym else object):
         self._rng = np.random.default_rng(seed)
         # Seed the global RNG for SensorNoiseModel compatibility
         np.random.seed(seed)
-        self.quad.reset()
+        # Start at the task target position so the drone doesn't begin
+        # on the ground where a single negative-thrust step is fatal.
+        # Small random offset (±0.5 m) forces the policy to generalize.
+        target_pos = self.task.target_pos(self.quad)
+        offset = self._rng.uniform(-0.5, 0.5, size=3)
+        self.quad.reset(position=target_pos + offset)
         if hasattr(self.task, 'reset'):
             self.task.reset(self.quad, rng=self._rng)
         if hasattr(self.obs_builder, '_prev_action'):
             self.obs_builder._prev_action = np.zeros(4, dtype=np.float32)
         self._step_idx = 0
         self._prev_action = None
-        # Pre-fill motor lag with hover-speed so the drone doesn't dip
-        # below z=0 on the very first step.
+        # Pre-fill motor lag with hover-speed so the drone doesn't dip.
         hover_w = np.sqrt(self.quad.mass * self.quad.g / (4 * self.quad.k_f))
         self.quad.motor_states = np.full(4, hover_w)
         obs = self.obs_builder.build(self.quad, self.task, action=None)
         return obs.astype(np.float32), {"t": 0.0}
 
     def step(self, action):
+        # Let LQRResidualAction know the task target
+        self.action_param._task_target = self.task.target_pos(self.quad)
         motor_speeds = self.action_param.to_motors(self.quad, action)
         self.quad.update(self.dt, motor_speeds)
         self._step_idx += 1

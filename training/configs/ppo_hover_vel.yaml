@@ -1,5 +1,5 @@
-# PPO hover training configuration
-# Train with: python -m training.train_ppo --config training/configs/ppo_hover.yaml --timesteps 500000
+# PPO hover training with VelocityLevelAction
+# Train with: python -m training.train_ppo --config training/configs/ppo_hover_vel.yaml --timesteps 500000 --action-type velocity
 env:
   dt: 0.01
   episode_len_s: 10.0
@@ -28,4 +28,4 @@ ppo:
   policy_kwargs:
     net_arch: [256, 128]
   save_freq: 50000
-  tensorboard_log: ./tb/ppo_hover
+  tensorboard_log: ./tb/ppo_hover_vel

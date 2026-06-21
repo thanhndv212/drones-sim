@@ -49,10 +49,17 @@ src/drones_sim/
 │   └── lqr.py                 # Full-state feedback LQR (CARE solution)
 ├── rl/
 │   ├── env.py                 # QuadcopterEnv (gymnasium.Env wrapper)
-│   ├── actions.py             # MotorSpeedAction, ThrustBodyRatesAction
+│   ├── actions.py             # MotorSpeedAction, ThrustBodyRatesAction, VelocityLevelAction, LQRResidualAction
 │   ├── observations.py        # RelativeStateObs (17-D observation)
 │   ├── tasks.py               # HoverTask, WaypointTask, TrackingTask
 │   └── reward.py              # Weighted multi-term reward function
+├── training/
+│   ├── train_ppo.py           # PPO training entry point (YAML config, CPU default, W&B)
+│   ├── eval_policy.py         # Policy evaluation with success/crash metrics
+│   ├── configs/
+│   │   ├── ppo_hover.yaml     # Config for thrust_rates / lqr_residual actions
+│   │   └── ppo_hover_vel.yaml # Config for velocity-level action
+│   └── checkpoints/           # Saved models and VecNormalize stats
 ├── logging/
 │   ├── csv_logger.py          # CSV telemetry logger
 │   └── json_logger.py         # JSON Lines telemetry logger
@@ -92,10 +99,76 @@ src/drones_sim/
 ### Reinforcement learning
 
 - **QuadcopterEnv** — Gymnasium `Env` compatible with SB3, CleanRL, Tianshou, RLlib
-- Two action spaces: raw motor speeds or thrust + body rates
-- Three tasks: hover, waypoint sequence, trajectory tracking
-- Weighted multi-term reward (position, velocity, attitude, action smoothness, alive/crash)
-- PPO training entry point in `training/train_ppo.py` with YAML config and TensorBoard logging
+- **Four action parameterizations** — three levels of abstraction plus a residual:
+
+| Action | Policy outputs | Stabilization |
+|--------|---------------|---------------|
+| `MotorSpeedAction` | Raw motor speeds (4× rad/s) | None (hardest) |
+| `ThrustBodyRatesAction` | Thrust delta + body rates (ωx,ωy,ωz) | Rate → torque P-controller |
+| `VelocityLevelAction` | World-frame velocity (vx,vy,vz) + yaw rate | Built-in cascaded P-controller (velocity → attitude → torque) |
+| `LQRResidualAction` | Delta on LQR motor speeds (in [-1,1]) | Full-state LQR feedback (CARE solution) |
+
+- **Three tasks**: hover, waypoint sequence, trajectory tracking
+- **Weighted multi-term reward** (position, velocity, attitude, action smoothness, alive/crash)
+- **PPO training** in `training/train_ppo.py` with YAML configs, TensorBoard logging, and optional W&B tracking
+- **Policy evaluation** in `training/eval_policy.py` (RMSE, success rate, crash rate)
+
+#### Training
+
+The training script defaults to CPU for small MLP policies (GPU transfer overhead dominates):
+
+```bash
+# LQR residual (recommended — 75%+ success rate at 500k steps)
+python -m training.train_ppo \
+  --config training/configs/ppo_hover.yaml \
+  --timesteps 500000 \
+  --action-type lqr_residual
+
+# Velocity-level (0% crash, 1.5m RMSE)
+python -m training.train_ppo \
+  --config training/configs/ppo_hover_vel.yaml \
+  --timesteps 200000 \
+  --action-type velocity
+
+# Thrust + body rates (legacy)
+python -m training.train_ppo \
+  --config training/configs/ppo_hover.yaml \
+  --timesteps 200000 \
+  --action-type thrust_rates
+```
+
+Track training with Weights & Biases:
+
+```bash
+python -m training.train_ppo \
+  --config training/configs/ppo_hover.yaml \
+  --action-type lqr_residual \
+  --track --wandb-project drones-sim-ppo
+```
+
+Open TensorBoard (logs are saved to `./tb/`):
+
+```bash
+tensorboard --logdir tb/
+```
+
+#### Evaluation
+
+```bash
+# Evaluate a trained checkpoint
+python -m training.eval_policy \
+  --path training/checkpoints/final.zip \
+  --episodes 20 \
+  --action-type lqr_residual
+
+# Expected output:
+#        pos_rmse: 0.1370
+#    success_rate: 0.7500
+#      crash_rate: 0.0000
+#     mean_reward: 6390.6716
+```
+
+
 
 ### Logging
 
