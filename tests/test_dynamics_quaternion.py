@@ -6,16 +6,13 @@ keeping the quaternion numerically unit-norm over long runs.
 """
 
 import numpy as np
-import pytest
 
 from drones_sim.dynamics import QuadcopterDynamics
 from drones_sim.math_utils import (
     quat_from_euler,
     quat_normalize,
-    quat_to_euler,
     quat_to_rotation_matrix,
 )
-
 
 # ---------------------------------------------------------------------------
 # Numerical stability

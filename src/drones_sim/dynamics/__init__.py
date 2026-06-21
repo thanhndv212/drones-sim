@@ -1,1 +1,1 @@
-from .quadcopter import QuadcopterDynamics
+from .quadcopter import QuadcopterDynamics  # noqa: F401

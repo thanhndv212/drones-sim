@@ -4,10 +4,9 @@ import numpy as np
 import pytest
 
 from drones_sim.trajectory import (
-    generate_minimum_snap,
     TrajectoryData,
+    generate_minimum_snap,
 )
-
 
 # ---------------------------------------------------------------------------
 # Minimum-snap tests

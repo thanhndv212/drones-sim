@@ -19,13 +19,12 @@ import numpy as np
 from numpy.typing import NDArray
 
 from ..math_utils import (
-    quat_derivative,
     quat_angular_velocity_jacobian,
+    quat_derivative,
     quat_normalize,
     quat_to_rotation_matrix,
 )
 from .ahrs import AHRS
-
 
 # ---------------------------------------------------------------------------
 # Full-state EKF (10-state) — from imu_ekf_simulation.py
@@ -482,8 +481,8 @@ class AdaptiveEKF:
         self.x += K @ innovation
 
         # Joseph form for numerical stability
-        I = np.eye(self.n)
-        IKH = I - K @ H
+        I_mat = np.eye(self.n)
+        IKH = I_mat - K @ H
         self.P = IKH @ self.P @ IKH.T + K @ self.R_accel @ K.T
 
     # -- state access ------------------------------------------------------

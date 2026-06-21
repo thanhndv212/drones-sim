@@ -9,6 +9,7 @@ import numpy as np
 
 from drones_sim.dynamics import QuadcopterDynamics
 from drones_sim.math_utils import euler_to_rotation_matrix
+from drones_sim.sensors.models import SensorNoiseModel
 
 
 def test_hover_specific_force_magnitude_equals_g():
@@ -61,8 +62,6 @@ def test_accel_simulation_includes_dynamics():
 # ---------------------------------------------------------------------------
 # Gauss-Markov bias random walk tests
 # ---------------------------------------------------------------------------
-
-from drones_sim.sensors.models import SensorNoiseModel
 
 
 def test_bias_constant_when_gauss_markov_disabled():

@@ -36,11 +36,11 @@ import numpy as np
 from numpy.typing import NDArray
 
 from ..math_utils import (
+    quat_derivative,
     quat_from_euler,
     quat_normalize,
     quat_to_euler,
     quat_to_rotation_matrix,
-    quat_derivative,
 )
 
 

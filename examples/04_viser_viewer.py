@@ -7,11 +7,11 @@ for interactive 3D playback.
 
 import numpy as np
 
-from drones_sim.dynamics import QuadcopterDynamics
 from drones_sim.control import QuadcopterController
+from drones_sim.dynamics import QuadcopterDynamics
 from drones_sim.math_utils import euler_to_rotation_matrix
-from drones_sim.visualization.viewer import DroneViewer
 from drones_sim.models import load_drone_urdf
+from drones_sim.visualization.viewer import DroneViewer
 
 
 def main():

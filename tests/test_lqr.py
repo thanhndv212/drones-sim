@@ -1,7 +1,6 @@
 """Tests for the LQR controller."""
 
 import numpy as np
-import pytest
 
 from drones_sim.control import LQRController
 from drones_sim.dynamics import QuadcopterDynamics

@@ -3,9 +3,9 @@
 import numpy as np
 import pytest
 
-from drones_sim.sensors.gps import GPSSimulator, GPSConfig, GPSData
-from drones_sim.trajectory import generate_hover_accel_cruise
 from drones_sim.estimation import ExtendedKalmanFilter
+from drones_sim.sensors.gps import GPSConfig, GPSSimulator
+from drones_sim.trajectory import generate_hover_accel_cruise
 
 
 @pytest.fixture
@@ -85,7 +85,7 @@ def test_ekf_gps_fusion_reduces_position_error(traj):
 
     dt = float(np.mean(np.diff(traj.t)))
     gps_dt = 1.0 / 5.0
-    gps_steps = max(1, int(round(gps_dt / dt)))
+    max(1, int(round(gps_dt / dt)))
 
     # EKF without GPS
     ekf_no_gps = ExtendedKalmanFilter(dt=dt)

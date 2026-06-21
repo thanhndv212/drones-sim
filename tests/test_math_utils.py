@@ -1,17 +1,16 @@
 """Tests for math_utils quaternion operations."""
 
 import numpy as np
-import pytest
 
 from drones_sim.math_utils import (
-    quat_normalize,
-    quat_multiply,
-    quat_conjugate,
-    quat_to_rotation_matrix,
-    quat_from_euler,
-    quat_to_euler,
-    quat_derivative,
     euler_to_rotation_matrix,
+    quat_conjugate,
+    quat_derivative,
+    quat_from_euler,
+    quat_multiply,
+    quat_normalize,
+    quat_to_euler,
+    quat_to_rotation_matrix,
 )
 
 
