@@ -1,6 +1,33 @@
-"""Quadcopter rigid-body dynamics based on Newton-Euler equations.
+"""Quadcopter rigid-body dynamics based on Newton–Euler equations.
 
-Consolidated from quadcopter_simulation.py.
+The internal state is quaternion-based (13-state)::
+
+    state[0:3]   position      [m]       ENU world frame (z-up)
+    state[3:6]   velocity      [m/s]     ENU world frame
+    state[6:10]  quaternion    [-]       Hamilton [w, x, y, z], body→world
+    state[10:13] omega_body    [rad/s]   body-frame angular velocity [p, q, r]
+
+Quaternions avoid the Euler-angle singularity at 90° pitch (gimbal lock) and
+match the convention used by ``ExtendedKalmanFilter`` (also ``[w,x,y,z]``).
+
+Public accessors preserve the original Euler-based API so that controllers,
+examples, and existing tests keep working without changes:
+
+    get_position()        -> (3,)
+    get_velocity()        -> (3,)
+    get_attitude()        -> (3,)   Euler [roll, pitch, yaw] derived from the quat
+    get_quaternion()      -> (4,)   [w, x, y, z]   (new, idiomatic)
+    get_angular_velocity()-> (3,)   [p, q, r] body frame
+
+Motor layout (X-configuration, looking from above):
+    Motor 1: +x   (front)
+    Motor 2: +y   (right)
+    Motor 3: -x   (back)
+    Motor 4: -y   (left)
+
+Motor dynamics: first-order lag  tau_m * d(omega)/dt + omega = omega_cmd.
+Set motor_time_constant=0.0 (default) for instantaneous motor response.
+Typical small-UAV value: 0.03–0.08 s.
 """
 
 from __future__ import annotations
@@ -8,22 +35,26 @@ from __future__ import annotations
 import numpy as np
 from numpy.typing import NDArray
 
-from ..math_utils import euler_to_rotation_matrix, angular_vel_to_euler_rates
+from ..math_utils import (
+    quat_from_euler,
+    quat_normalize,
+    quat_to_euler,
+    quat_to_rotation_matrix,
+    quat_derivative,
+)
 
 
 class QuadcopterDynamics:
-    """12-state quadcopter model: [pos(3), vel(3), euler(3), omega_body(3)].
+    """13-state quaternion quadcopter model.
 
-    Motor layout (X-configuration, looking from above):
-        Motor 1: +x   (front)
-        Motor 2: +y   (right)
-        Motor 3: -x   (back)
-        Motor 4: -y   (left)
-
-    Motor dynamics: first-order lag  tau_m * d(omega)/dt + omega = omega_cmd.
-    Set motor_time_constant=0.0 (default) for instantaneous motor response.
-    Typical small UAV value: 0.03–0.08 s.
+    See module docstring for the state layout and public API.  The class keeps
+    the original Euler-based accessors alive (``get_attitude``) while storing
+    attitude as a unit quaternion internally — eliminating gimbal lock while
+    remaining a drop-in replacement for the previous 12-state Euler plant.
     """
+
+    # State size changed from 12 (Euler) to 13 (quaternion).
+    STATE_SIZE = 13
 
     def __init__(
         self,
@@ -45,18 +76,26 @@ class QuadcopterDynamics:
         self.g = g
         self.motor_time_constant = motor_time_constant
 
-        # state: [x, y, z, vx, vy, vz, phi, theta, psi, p, q, r]
-        self.state = np.zeros(12)
+        # state: [pos(3), vel(3), quat(4), omega_body(3)]
+        self.state = np.zeros(self.STATE_SIZE)
+        self.state[6] = 1.0  # identity quaternion [w, x, y, z]
         # actual motor speeds (lag state); equals commanded speeds when tau_m=0
         self.motor_states = np.zeros(4)
 
     def reset(self, position: NDArray | None = None, attitude: NDArray | None = None) -> None:
-        self.state = np.zeros(12)
+        """Reset state to rest at origin with identity orientation.
+
+        ``attitude`` (if given) is interpreted as Euler [roll, pitch, yaw] and
+        converted to a quaternion — preserving the legacy call signature.
+        """
+        self.state = np.zeros(self.STATE_SIZE)
+        self.state[6] = 1.0  # identity quaternion
         self.motor_states = np.zeros(4)
         if position is not None:
             self.state[:3] = position
         if attitude is not None:
-            self.state[6:9] = attitude
+            # Backward-compatible: caller passes Euler angles.
+            self.state[6:10] = quat_from_euler(attitude[0], attitude[1], attitude[2])
 
     # -- state accessors ---------------------------------------------------
 
@@ -67,19 +106,37 @@ class QuadcopterDynamics:
         return self.state[3:6].copy()
 
     def get_attitude(self) -> NDArray:
-        return self.state[6:9].copy()
+        """Euler angles [roll, pitch, yaw] derived from the internal quaternion.
+
+        Backward-compatible with the previous 12-state plant so controllers and
+        examples that consume Euler angles continue to work unmodified.
+        """
+        return quat_to_euler(self.state[6:10])
+
+    def get_quaternion(self) -> NDArray:
+        """Unit quaternion [w, x, y, z] (body→world)."""
+        return self.state[6:10].copy()
 
     def get_angular_velocity(self) -> NDArray:
-        return self.state[9:12].copy()
+        return self.state[10:13].copy()
 
     # -- dynamics ----------------------------------------------------------
 
     def rotation_matrix(self) -> NDArray:
-        phi, theta, psi = self.state[6:9]
-        return euler_to_rotation_matrix(phi, theta, psi)
+        """World←body rotation matrix from the internal quaternion."""
+        return quat_to_rotation_matrix(self.state[6:10])
 
     def _derivatives(self, state: NDArray, motor_speeds: NDArray) -> NDArray:
-        """Compute state derivatives for a given state and motor speeds."""
+        """Compute the 13-state derivative for a given state and motor speeds.
+
+        Quaternion kinematics are integrated as
+
+            q_dot = 0.5 * q ⊗ [0, omega]
+
+        which preserves attitude information through arbitrary rotations
+        (no gimbal-lock singularity).  Renormalisation happens once per
+        ``update()`` step (see ``update``).
+        """
         T = self.k_f * np.sum(motor_speeds**2)
         tau_phi = self.k_f * self.arm_length * (motor_speeds[1] ** 2 - motor_speeds[3] ** 2)
         tau_theta = self.k_f * self.arm_length * (motor_speeds[2] ** 2 - motor_speeds[0] ** 2)
@@ -89,25 +146,24 @@ class QuadcopterDynamics:
         )
         torques = np.array([tau_phi, tau_theta, tau_psi])
 
-        vx, vy, vz = state[3:6]
-        phi, theta, psi = state[6:9]
-        p, q, r = state[9:12]
+        vel = state[3:6]
+        quat = state[6:10]
+        omega = state[10:13]
 
-        R = euler_to_rotation_matrix(phi, theta, psi)
-        F_thrust = R @ np.array([0, 0, T])
-        F_drag = -self.k_d * np.array([vx, vy, vz])
-        F_gravity = np.array([0, 0, -self.mass * self.g])
+        R = quat_to_rotation_matrix(quat)
+        F_thrust = R @ np.array([0.0, 0.0, T])
+        F_drag = -self.k_d * vel
+        F_gravity = np.array([0.0, 0.0, -self.mass * self.g])
         accel = (F_thrust + F_drag + F_gravity) / self.mass
 
-        omega = np.array([p, q, r])
         angular_accel = np.linalg.solve(self.I, torques - np.cross(omega, self.I @ omega))
-        euler_rates = angular_vel_to_euler_rates(phi, theta, omega)
+        quat_dot = quat_derivative(quat, omega)
 
-        deriv = np.zeros(12)
-        deriv[:3] = [vx, vy, vz]
+        deriv = np.zeros(self.STATE_SIZE)
+        deriv[:3] = vel
         deriv[3:6] = accel
-        deriv[6:9] = euler_rates
-        deriv[9:12] = angular_accel
+        deriv[6:10] = quat_dot
+        deriv[10:13] = angular_accel
         return deriv
 
     def get_motor_speeds(self) -> NDArray:
@@ -119,6 +175,10 @@ class QuadcopterDynamics:
 
         When motor_time_constant > 0 the actual rotor speeds follow a first-order
         lag:  tau_m * d(omega)/dt + omega = omega_cmd.
+
+        The quaternion part of the state is renormalised after the RK4 step to
+        counter numerical drift (quaternions slowly lose unit norm under
+        fixed-step RK4, which would otherwise corrupt the rotation matrix).
         """
         motor_cmds = np.maximum(motor_speeds, 0.0)
 
@@ -139,6 +199,8 @@ class QuadcopterDynamics:
         k4 = self._derivatives(self.state + dt * k3, actual_motors)
 
         self.state += (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+        # Renormalise quaternion to suppress RK4 norm drift.
+        self.state[6:10] = quat_normalize(self.state[6:10])
         return self.state.copy()
 
     # -- motor allocation helpers ------------------------------------------
