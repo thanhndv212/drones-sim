@@ -66,6 +66,7 @@ class QuadcopterDynamics:
         k_d: float = 0.1,
         g: float = 9.81,
         motor_time_constant: float = 0.0,
+        disturbances: list | None = None,
     ):
         self.mass = mass
         self.arm_length = arm_length
@@ -75,12 +76,14 @@ class QuadcopterDynamics:
         self.k_d = k_d
         self.g = g
         self.motor_time_constant = motor_time_constant
+        self.disturbances = disturbances if disturbances is not None else []
 
         # state: [pos(3), vel(3), quat(4), omega_body(3)]
         self.state = np.zeros(self.STATE_SIZE)
         self.state[6] = 1.0  # identity quaternion [w, x, y, z]
         # actual motor speeds (lag state); equals commanded speeds when tau_m=0
         self.motor_states = np.zeros(4)
+        self._sim_time = 0.0
 
     def reset(self, position: NDArray | None = None, attitude: NDArray | None = None) -> None:
         """Reset state to rest at origin with identity orientation.
@@ -91,11 +94,16 @@ class QuadcopterDynamics:
         self.state = np.zeros(self.STATE_SIZE)
         self.state[6] = 1.0  # identity quaternion
         self.motor_states = np.zeros(4)
+        self._sim_time = 0.0
         if position is not None:
             self.state[:3] = position
         if attitude is not None:
             # Backward-compatible: caller passes Euler angles.
             self.state[6:10] = quat_from_euler(attitude[0], attitude[1], attitude[2])
+        for d in self.disturbances:
+            d.reset()
+            # Give disturbances a chance to restore any modified parameters
+            d.modify_dynamics(self, 0.0)
 
     # -- state accessors ---------------------------------------------------
 
@@ -126,7 +134,7 @@ class QuadcopterDynamics:
         """World←body rotation matrix from the internal quaternion."""
         return quat_to_rotation_matrix(self.state[6:10])
 
-    def _derivatives(self, state: NDArray, motor_speeds: NDArray) -> NDArray:
+    def _derivatives(self, state: NDArray, motor_speeds: NDArray, *, t: float | None = None, dt: float = 0.01) -> NDArray:
         """Compute the 13-state derivative for a given state and motor speeds.
 
         Quaternion kinematics are integrated as
@@ -136,6 +144,9 @@ class QuadcopterDynamics:
         which preserves attitude information through arbitrary rotations
         (no gimbal-lock singularity).  Renormalisation happens once per
         ``update()`` step (see ``update``).
+
+        When *t* is provided and disturbances are active, their external
+        force/torque contributions are summed into the total wrench.
         """
         T = self.k_f * np.sum(motor_speeds**2)
         tau_phi = self.k_f * self.arm_length * (motor_speeds[1] ** 2 - motor_speeds[3] ** 2)
@@ -154,9 +165,18 @@ class QuadcopterDynamics:
         F_thrust = R @ np.array([0.0, 0.0, T])
         F_drag = -self.k_d * vel
         F_gravity = np.array([0.0, 0.0, -self.mass * self.g])
-        accel = (F_thrust + F_drag + F_gravity) / self.mass
 
-        angular_accel = np.linalg.solve(self.I, torques - np.cross(omega, self.I @ omega))
+        total_force = F_thrust + F_drag + F_gravity
+        total_torque = torques
+
+        # --- disturbance contributions -----------------------------------
+        if t is not None and self.disturbances:
+            for d in self.disturbances:
+                total_force += d.external_force(t, dt, state)
+                total_torque += d.external_torque(t, dt, state)
+
+        accel = total_force / self.mass
+        angular_accel = np.linalg.solve(self.I, total_torque - np.cross(omega, self.I @ omega))
         quat_dot = quat_derivative(quat, omega)
 
         deriv = np.zeros(self.STATE_SIZE)
@@ -192,13 +212,19 @@ class QuadcopterDynamics:
             self.motor_states = motor_cmds
             actual_motors = motor_cmds
 
+        # --- apply disturbance parameter modifications --------------------
+        for d in self.disturbances:
+            d.modify_dynamics(self, self._sim_time)
+
         # --- RK4 plant integration ----------------------------------------
-        k1 = self._derivatives(self.state, actual_motors)
-        k2 = self._derivatives(self.state + 0.5 * dt * k1, actual_motors)
-        k3 = self._derivatives(self.state + 0.5 * dt * k2, actual_motors)
-        k4 = self._derivatives(self.state + dt * k3, actual_motors)
+        t0 = self._sim_time
+        k1 = self._derivatives(self.state, actual_motors, t=t0, dt=dt)
+        k2 = self._derivatives(self.state + 0.5 * dt * k1, actual_motors, t=t0 + 0.5 * dt, dt=dt)
+        k3 = self._derivatives(self.state + 0.5 * dt * k2, actual_motors, t=t0 + 0.5 * dt, dt=dt)
+        k4 = self._derivatives(self.state + dt * k3, actual_motors, t=t0 + dt, dt=dt)
 
         self.state += (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+        self._sim_time += dt
         # Renormalise quaternion to suppress RK4 norm drift.
         self.state[6:10] = quat_normalize(self.state[6:10])
         return self.state.copy()
