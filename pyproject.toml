@@ -16,6 +16,8 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "ruff"]
+rl  = ["torch>=2.2", "stable-baselines3>=2.3", "gymnasium>=0.29", "tensorboard>=2.15", "pyyaml>=6.0"]
+rl-dev = ["drones-sim[rl]", "wandb", "optuna>=3.5", "moviepy"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
