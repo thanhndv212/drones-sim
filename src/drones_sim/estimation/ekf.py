@@ -14,6 +14,7 @@ Two modes of operation:
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import dataclass, field
 
 import numpy as np
 from numpy.typing import NDArray
@@ -24,7 +25,22 @@ from ..math_utils import (
     quat_normalize,
     quat_to_rotation_matrix,
 )
+from ..state import VehicleState
 from .ahrs import AHRS
+
+
+@dataclass
+class EKFDiagnostics:
+    """Innovation statistics and measurement acceptance counts."""
+
+    accepted: dict[str, int] = field(default_factory=dict)
+    rejected: dict[str, int] = field(default_factory=dict)
+    last_nis: dict[str, float] = field(default_factory=dict)
+
+    def record(self, sensor: str, nis: float, accepted: bool) -> None:
+        target = self.accepted if accepted else self.rejected
+        target[sensor] = target.get(sensor, 0) + 1
+        self.last_nis[sensor] = float(nis)
 
 # ---------------------------------------------------------------------------
 # Full-state EKF (10-state) — from imu_ekf_simulation.py
@@ -69,6 +85,8 @@ class ExtendedKalmanFilter:
         initial_state: NDArray | None = None,
         gravity: NDArray | None = None,
         mag_ref: NDArray | None = None,
+        innovation_gate: float | None = 16.27,
+        reacquisition_limit: int = 3,
     ):
         self.n = 16
         self.dt = dt
@@ -87,6 +105,10 @@ class ExtendedKalmanFilter:
 
         self.gravity = gravity if gravity is not None else np.array([0.0, 0.0, 9.81])
         self.mag_ref = mag_ref if mag_ref is not None else np.array([20.0, 0.0, -40.0])
+        self.innovation_gate = innovation_gate
+        self.reacquisition_limit = max(int(reacquisition_limit), 1)
+        self._rejection_streak: dict[str, int] = {}
+        self.diagnostics = EKFDiagnostics()
 
         # Covariance
         self.P = np.eye(self.n) * 0.01
@@ -108,6 +130,57 @@ class ExtendedKalmanFilter:
         # Measurement noise
         self.R_accel = np.eye(3) * 0.003   # σ≈0.05 m/s² → var≈0.0025
         self.R_mag   = np.eye(3) * 0.5
+
+    def _measurement_update(
+        self,
+        residual: NDArray,
+        H: NDArray,
+        measurement_noise: NDArray,
+        sensor: str,
+    ) -> bool:
+        """Apply a gated Joseph-form update and return whether it was accepted."""
+        S = H @ self.P @ H.T + measurement_noise
+        try:
+            solved_residual = np.linalg.solve(S, residual)
+            gain = np.linalg.solve(S, H @ self.P).T
+        except np.linalg.LinAlgError:
+            self.diagnostics.record(sensor, float("inf"), False)
+            return False
+        nis = float(residual @ solved_residual)
+        absolute_sensor = sensor in {"gps", "position", "velocity", "altitude"}
+        accepted = self.innovation_gate is None or nis <= self.innovation_gate
+        if accepted:
+            self._rejection_streak[sensor] = 0
+        elif absolute_sensor:
+            streak = self._rejection_streak.get(sensor, 0) + 1
+            self._rejection_streak[sensor] = streak
+            # A gate that can never re-acquire turns a temporary model error
+            # into permanent dead reckoning. After several consecutive fixes,
+            # treat the stream as a state jump rather than isolated outliers.
+            if streak >= self.reacquisition_limit:
+                accepted = True
+                self._rejection_streak[sensor] = 0
+        self.diagnostics.record(sensor, nis, accepted)
+        if not accepted:
+            # Absolute sensors must be able to re-acquire after a real jump or
+            # temporary model mismatch. Inflate only the observed subspace;
+            # the state is left untouched, so a one-off outlier is still fully
+            # rejected while a later consistent fix can pass the gate.
+            if absolute_sensor:
+                gate = max(float(self.innovation_gate), 1e-9)
+                scale = min(max(nis / gate, 1.0), 100.0)
+                self.P += H.T @ measurement_noise @ H * (scale - 1.0)
+                self.P = 0.5 * (self.P + self.P.T)
+            return False
+        self.x += gain @ residual
+        self.x[6:10] = quat_normalize(self.x[6:10])
+        identity_minus_gain = np.eye(self.n) - gain @ H
+        self.P = (
+            identity_minus_gain @ self.P @ identity_minus_gain.T
+            + gain @ measurement_noise @ gain.T
+        )
+        self.P = 0.5 * (self.P + self.P.T)
+        return True
 
     # -- prediction --------------------------------------------------------
 
@@ -163,6 +236,30 @@ class ExtendedKalmanFilter:
         if accel_c is not None:
             R = quat_to_rotation_matrix(quat)
 
+            # Translational sensitivity to attitude. Omitting this coupling
+            # makes GPS innovations over-confident during maneuvering.
+            ax, ay, az = accel_c
+            w, x, y, z = quat
+            accel_rotation_jacobian = np.array([
+                [-2*z*ay + 2*y*az,
+                 2*y*ay + 2*z*az,
+                 -4*y*ax + 2*x*ay + 2*w*az,
+                 -4*z*ax - 2*w*ay + 2*x*az],
+                [2*z*ax - 2*x*az,
+                 2*y*ax - 4*x*ay - 2*w*az,
+                 2*x*ax + 2*z*az,
+                 2*w*ax - 4*z*ay + 2*y*az],
+                [-2*y*ax + 2*x*ay,
+                 2*z*ax + 2*w*ay - 4*x*az,
+                 -2*w*ax + 2*z*ay - 4*y*az,
+                 2*x*ax + 2*y*ay],
+            ])
+            accel_rotation_jacobian -= np.outer(
+                accel_rotation_jacobian @ quat, quat
+            )
+            F[3:6, 6:10] = accel_rotation_jacobian * self.dt
+            F[0:3, 6:10] = accel_rotation_jacobian * (0.5 * self.dt**2)
+
             # Velocity sensitivity to accel_bias: ∂vel_new/∂b_a = -R*dt
             F[3:6, 10:13] = -R * self.dt
 
@@ -185,12 +282,16 @@ class ExtendedKalmanFilter:
 
     # -- accelerometer correction ------------------------------------------
 
-    def correct_accel(self, accel: NDArray) -> None:
+    def correct_accel(self, accel: NDArray) -> bool:
         """Attitude correction from accelerometer (gravity direction).
 
         Only corrects quaternion — velocity is propagated in predict() from
         the same accel measurement.  The attitude update columns of H are
         non-zero; position/velocity/bias columns are zero.
+
+        This pseudo-measurement assumes negligible translational acceleration.
+        Do not apply it continuously during aggressive flight; use it during
+        detected quasi-static periods or rely on gyro/magnetometer propagation.
         """
         quat      = self.x[6:10]
         accel_bias = self.x[10:13]
@@ -199,45 +300,24 @@ class ExtendedKalmanFilter:
         residual  = (accel - accel_bias) - expected
 
         H = self._accel_jacobian(quat)
-        S = H @ self.P @ H.T + self.R_accel
-        K = self.P @ H.T @ np.linalg.inv(S)
-
-        self.x += K @ residual
-        self.x[6:10] = quat_normalize(self.x[6:10])
-        assert abs(np.linalg.norm(self.x[6:10]) - 1.0) < 1e-3, (
-            f"EKF quaternion norm={np.linalg.norm(self.x[6:10]):.6f} after correct_accel "
-            "\u2014 filter diverging"
-        )
-        # Joseph form: P = (I-KH)P(I-KH)^T + K*R_accel*K^T
-        IKH = np.eye(self.n) - K @ H
-        self.P = IKH @ self.P @ IKH.T + K @ self.R_accel @ K.T
+        return self._measurement_update(residual, H, self.R_accel, "accel")
 
     # -- magnetometer correction -------------------------------------------
 
-    def correct_mag(self, mag: NDArray) -> None:
+    def correct_mag(self, mag: NDArray) -> bool:
         quat = self.x[6:10]
         R    = quat_to_rotation_matrix(quat)
         expected = R.T @ self.mag_ref
         residual = mag - expected    # mag has its own fixed bias; no state bias term
 
         H = self._mag_jacobian(quat)
-        S = H @ self.P @ H.T + self.R_mag
-        K = self.P @ H.T @ np.linalg.inv(S)
-
-        self.x += K @ residual
-        self.x[6:10] = quat_normalize(self.x[6:10])
-        assert abs(np.linalg.norm(self.x[6:10]) - 1.0) < 1e-3, (
-            f"EKF quaternion norm={np.linalg.norm(self.x[6:10]):.6f} after correct_mag "
-            "\u2014 filter diverging"
-        )
-        IKH = np.eye(self.n) - K @ H
-        self.P = IKH @ self.P @ IKH.T + K @ self.R_mag @ K.T
+        return self._measurement_update(residual, H, self.R_mag, "mag")
 
     # -- GPS / barometer position correction -------------------------------
 
     def correct_position(
         self, pos_meas: NDArray, R_pos: NDArray | None = None
-    ) -> None:
+    ) -> bool:
         """Full 3-D GPS position update.  pos_meas shape: (3,)."""
         m = len(pos_meas)
         if R_pos is None:
@@ -245,41 +325,45 @@ class ExtendedKalmanFilter:
         H = np.zeros((m, self.n))
         H[:m, :m] = np.eye(m)
         residual = pos_meas - self.x[:m]
-        S = H @ self.P @ H.T + R_pos
-        K = self.P @ H.T @ np.linalg.inv(S)
-        self.x += K @ residual
-        self.x[6:10] = quat_normalize(self.x[6:10])
-        IKH = np.eye(self.n) - K @ H
-        self.P = IKH @ self.P @ IKH.T + K @ R_pos @ K.T
+        return self._measurement_update(residual, H, R_pos, "position")
 
     def correct_velocity(
         self, vel_meas: NDArray, R_vel: NDArray | None = None
-    ) -> None:
+    ) -> bool:
         """3-D velocity update from GPS Doppler / DVL.  vel_meas shape: (3,)."""
         if R_vel is None:
             R_vel = np.eye(3) * 0.01   # GPS vel std~0.1 m/s → var=0.01
         H = np.zeros((3, self.n))
         H[0:3, 3:6] = np.eye(3)
         residual = vel_meas - self.x[3:6]
-        S = H @ self.P @ H.T + R_vel
-        K = self.P @ H.T @ np.linalg.inv(S)
-        self.x += K @ residual
-        self.x[6:10] = quat_normalize(self.x[6:10])
-        IKH = np.eye(self.n) - K @ H
-        self.P = IKH @ self.P @ IKH.T + K @ R_vel @ K.T
+        return self._measurement_update(residual, H, R_vel, "velocity")
 
-    def correct_altitude(self, z_meas: float, r_z: float = 0.05) -> None:
+    def correct_gps(
+        self,
+        position: NDArray,
+        velocity: NDArray,
+        covariance: NDArray | None = None,
+    ) -> bool:
+        """Joint position/velocity GNSS update with one consistency gate."""
+        measurement = np.concatenate([position, velocity])
+        H = np.zeros((6, self.n))
+        H[:3, :3] = np.eye(3)
+        H[3:, 3:6] = np.eye(3)
+        noise = np.diag([0.25, 0.25, 0.25, 0.01, 0.01, 0.01])
+        if covariance is not None:
+            noise = np.asarray(covariance, dtype=float)
+            if noise.shape != (6, 6):
+                raise ValueError("GPS covariance must have shape (6, 6)")
+        residual = measurement - self.x[:6]
+        return self._measurement_update(residual, H, noise, "gps")
+
+    def correct_altitude(self, z_meas: float, r_z: float = 0.05) -> bool:
         """1-D barometer altitude update.  Anchors vertical dead-reckoning."""
         H = np.zeros((1, self.n))
         H[0, 2] = 1.0
         residual = np.array([z_meas - self.x[2]])
         R_z = np.array([[r_z]])
-        S = H @ self.P @ H.T + R_z
-        K = self.P @ H.T @ np.linalg.inv(S)
-        self.x += (K @ residual).ravel()
-        self.x[6:10] = quat_normalize(self.x[6:10])
-        IKH = np.eye(self.n) - K @ H
-        self.P = IKH @ self.P @ IKH.T + K @ R_z @ K.T
+        return self._measurement_update(residual, H, R_z, "altitude")
 
     # -- state access ------------------------------------------------------
 
@@ -291,6 +375,19 @@ class ExtendedKalmanFilter:
             "accel_bias": self.x[10:13].copy(),
             "gyro_bias":  self.x[13:16].copy(),
         }
+
+    def get_vehicle_state(
+        self, body_rates: NDArray | None = None, *, time: float = 0.0
+    ) -> VehicleState:
+        """Return the estimate through the package-wide typed state API."""
+        rates = np.zeros(3) if body_rates is None else body_rates
+        return VehicleState(
+            position=self.x[:3],
+            velocity=self.x[3:6],
+            quaternion=self.x[6:10],
+            body_rates=rates,
+            time=time,
+        )
 
     # -- Jacobians (analytical) --------------------------------------------
 
@@ -439,7 +536,7 @@ class AdaptiveEKF:
         R = quat_to_rotation_matrix(self.orientation)
 
         accel_bias = self.x[6:9]
-        accel_world = R @ (accel - accel_bias) + self.gravity
+        accel_world = R @ (accel - accel_bias) - self.gravity
 
         pos, vel = self.x[:3], self.x[3:6]
         self.x[:3] = pos + vel * self.dt + 0.5 * accel_world * self.dt**2
@@ -457,7 +554,7 @@ class AdaptiveEKF:
     def correct(self, accel: NDArray, adaptive_factor: float = 1.0) -> None:
         R = quat_to_rotation_matrix(self.orientation)
         accel_bias = self.x[6:9]
-        expected = R.T @ (-self.gravity) + accel_bias
+        expected = R.T @ self.gravity + accel_bias
         innovation = accel - expected
 
         self._innovations.append(innovation)

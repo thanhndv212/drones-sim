@@ -34,6 +34,13 @@ class Disturbance(ABC):
     def reset(self) -> None:
         """Re-seed any internal state (called at the start of a new episode)."""
 
+    def advance(self, t: float, dt: float, state: NDArray) -> None:
+        """Advance stochastic state once per integration step.
+
+        This is separate from force evaluation because RK4 evaluates the force
+        model four times per integration step.
+        """
+
     def external_force(self, t: float, dt: float, state: NDArray) -> NDArray:
         """External force in the world frame [N].
 
@@ -74,9 +81,12 @@ class ConstantWind(Disturbance):
         self.k_d = k_d
 
     def external_force(self, t: float, dt: float, state: NDArray) -> NDArray:
-        return self.k_d * self.velocity
+        # Retained for direct/legacy callers. The plant calls ``advance`` once
+        # and obtains the resulting wind through ``wind_velocity``.
+        self.advance(t, dt, state)
+        return np.zeros(3)
 
-    def wind_velocity(self) -> NDArray:
+    def wind_velocity(self, t: float = 0.0) -> NDArray:
         return self.velocity.copy()
 
 
@@ -88,10 +98,10 @@ class StepWind(Disturbance):
         self.t_on = t_on
 
     def external_force(self, t: float, dt: float, state: NDArray) -> NDArray:
-        if t < self.t_on:
-            return np.zeros(3)
-        # Force = drag from relative velocity (handled in dynamics)
-        return np.zeros(3)  # velocity deficit, drag handled in dynamics
+        return np.zeros(3)
+
+    def wind_velocity(self, t: float = 0.0) -> NDArray:
+        return self.velocity.copy() if t >= self.t_on else np.zeros(3)
 
 
 class DrydenGust(Disturbance):
@@ -122,15 +132,19 @@ class DrydenGust(Disturbance):
         self.length_scale = length_scale
         self.reference_speed = reference_speed
 
+        self._seed = seed
         self._rng = np.random.default_rng(seed)
         self._wind = np.zeros(3)
         self._alpha_cache: float | None = None  # exp(-V/L * dt), cached per dt
 
     def reset(self) -> None:
+        self._rng = np.random.default_rng(self._seed)
         self._wind = np.zeros(3)
         self._alpha_cache = None
 
-    def external_force(self, t: float, dt: float, state: NDArray) -> NDArray:
+    def advance(self, t: float, dt: float, state: NDArray) -> None:
+        if dt <= 0.0:
+            return
         # Build the Dryden filter coefficients for this dt (cached).
         if self._alpha_cache is None or self._alpha_cache != dt:
             V, L = self.reference_speed, self.length_scale
@@ -142,10 +156,12 @@ class DrydenGust(Disturbance):
         drive = self._rng.normal(0.0, 1.0, 3) / np.sqrt(dt + 1e-12)
         self._wind = self._alpha * self._wind + self._beta * drive
 
-        # Force = drag from relative velocity
-        # Wind velocity stored in self._wind; drag proportional to rel velocity
-        # (applied in dynamics via modify_dynamics or external_force)
+    def external_force(self, t: float, dt: float, state: NDArray) -> NDArray:
+        self.advance(t, dt, state)
         return np.zeros(3)
+
+    def wind_velocity(self, t: float = 0.0) -> NDArray:
+        return self._wind.copy()
 
 
 # ---------------------------------------------------------------------------
@@ -176,12 +192,12 @@ class MotorFailure(Disturbance):
     def modify_dynamics(self, quad: object, t: float) -> None:
         if not self._failed and t >= self.t_fail:
             self._failed = True
-        # The actual k_f modification happens in _derivatives via the
-        # motor-specific k_f lookup.  For simplicity we modify the
-        # quad's k_f scale factor — implementations wire this by
-        # storing a per-motor efficiency vector that _derivatives reads.
-        # This stub documents the contract; the concrete implementation
-        # is handled in QuadcopterDynamics._derivatives.
+
+    def rotor_efficiencies(self, t: float) -> NDArray:
+        efficiency = np.ones(4)
+        if t >= self.t_fail:
+            efficiency[self.motor_indices] = self.efficiency
+        return efficiency
 
 
 class PayloadDrop(Disturbance):

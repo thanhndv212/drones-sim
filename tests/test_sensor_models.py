@@ -101,6 +101,7 @@ def test_bias_random_walk_increases_variance():
         bias_range=0.0,
         bias_time_constant=100.0,      # slow decay
         bias_random_walk_std=0.001,
+        rng=np.random.default_rng(0),
     )
     model.bias = np.zeros(3)
     initial_bias = model.bias.copy()

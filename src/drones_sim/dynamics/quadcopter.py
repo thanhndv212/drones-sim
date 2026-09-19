@@ -1,33 +1,13 @@
-"""Quadcopter rigid-body dynamics based on Newton–Euler equations.
+"""Nonlinear six-degree-of-freedom quadcopter rigid-body dynamics.
 
-The internal state is quaternion-based (13-state)::
+Frames use ENU world coordinates (z up) and a front-right-up body frame.
+Quaternions are Hamilton ``[w, x, y, z]`` and rotate body vectors to world.
+The numerical state remains a 13-vector for compatibility::
 
-    state[0:3]   position      [m]       ENU world frame (z-up)
-    state[3:6]   velocity      [m/s]     ENU world frame
-    state[6:10]  quaternion    [-]       Hamilton [w, x, y, z], body→world
-    state[10:13] omega_body    [rad/s]   body-frame angular velocity [p, q, r]
+    [position(3), velocity(3), quaternion(4), body_rates(3)]
 
-Quaternions avoid the Euler-angle singularity at 90° pitch (gimbal lock) and
-match the convention used by ``ExtendedKalmanFilter`` (also ``[w,x,y,z]``).
-
-Public accessors preserve the original Euler-based API so that controllers,
-examples, and existing tests keep working without changes:
-
-    get_position()        -> (3,)
-    get_velocity()        -> (3,)
-    get_attitude()        -> (3,)   Euler [roll, pitch, yaw] derived from the quat
-    get_quaternion()      -> (4,)   [w, x, y, z]   (new, idiomatic)
-    get_angular_velocity()-> (3,)   [p, q, r] body frame
-
-Motor layout (X-configuration, looking from above):
-    Motor 1: +x   (front)
-    Motor 2: +y   (right)
-    Motor 3: -x   (back)
-    Motor 4: -y   (left)
-
-Motor dynamics: first-order lag  tau_m * d(omega)/dt + omega = omega_cmd.
-Set motor_time_constant=0.0 (default) for instantaneous motor response.
-Typical small-UAV value: 0.03–0.08 s.
+The plant models bounded first-order actuators, arbitrary rigid-body rotation,
+anisotropic linear/quadratic air drag, rotor failures, and external wrenches.
 """
 
 from __future__ import annotations
@@ -42,18 +22,17 @@ from ..math_utils import (
     quat_to_euler,
     quat_to_rotation_matrix,
 )
+from ..state import VehicleState
+from .config import QuadcopterConfig
 
 
 class QuadcopterDynamics:
-    """13-state quaternion quadcopter model.
+    """A validated 13-state quaternion quadcopter model.
 
-    See module docstring for the state layout and public API.  The class keeps
-    the original Euler-based accessors alive (``get_attitude``) while storing
-    attitude as a unit quaternion internally — eliminating gimbal lock while
-    remaining a drop-in replacement for the previous 12-state Euler plant.
+    Legacy scalar constructor arguments are retained. New code should prefer a
+    :class:`QuadcopterConfig`, which makes units and actuator limits explicit.
     """
 
-    # State size changed from 12 (Euler) to 13 (quaternion).
     STATE_SIZE = 13
 
     def __init__(
@@ -63,49 +42,97 @@ class QuadcopterDynamics:
         inertia: NDArray | None = None,
         k_f: float = 1.0e-6,
         k_m: float = 1.0e-7,
-        k_d: float = 0.1,
+        k_d: float | NDArray = 0.1,
         g: float = 9.81,
         motor_time_constant: float = 0.0,
         disturbances: list | None = None,
-    ):
-        self.mass = mass
-        self.arm_length = arm_length
-        self.I = inertia if inertia is not None else np.diag([0.01, 0.01, 0.018])
-        self.k_f = k_f
-        self.k_m = k_m
-        self.k_d = k_d
-        self.g = g
-        self.motor_time_constant = motor_time_constant
-        self.disturbances = disturbances if disturbances is not None else []
+        *,
+        config: QuadcopterConfig | None = None,
+        quadratic_drag: float | NDArray = 0.0,
+        max_motor_speed: float = 4000.0,
+    ) -> None:
+        cfg = config or QuadcopterConfig(
+            mass=mass,
+            arm_length=arm_length,
+            inertia=np.diag([0.01, 0.01, 0.018]) if inertia is None else inertia,
+            thrust_coefficient=k_f,
+            moment_coefficient=k_m,
+            linear_drag=k_d,
+            quadratic_drag=quadratic_drag,
+            gravity=g,
+            motor_time_constant=motor_time_constant,
+            max_motor_speed=max_motor_speed,
+        )
+        self.config = cfg
 
-        # state: [pos(3), vel(3), quat(4), omega_body(3)]
+        # Public aliases preserve the long-standing API used by examples/RL.
+        self.mass = cfg.mass
+        self.arm_length = cfg.arm_length
+        self.I = cfg.inertia.copy()
+        self.k_f = cfg.thrust_coefficient
+        self.k_m = cfg.moment_coefficient
+        self.k_d = float(cfg.linear_drag[0]) if np.allclose(
+            cfg.linear_drag, cfg.linear_drag[0]
+        ) else cfg.linear_drag.copy()
+        self.g = cfg.gravity
+        self.motor_time_constant = cfg.motor_time_constant
+        self.min_motor_speed = cfg.min_motor_speed
+        self.max_motor_speed = cfg.max_motor_speed
+        self.disturbances = list(disturbances or [])
+
         self.state = np.zeros(self.STATE_SIZE)
-        self.state[6] = 1.0  # identity quaternion [w, x, y, z]
-        # actual motor speeds (lag state); equals commanded speeds when tau_m=0
+        self.state[6] = 1.0
         self.motor_states = np.zeros(4)
+        self.last_acceleration = np.zeros(3)
+        self.last_angular_acceleration = np.zeros(3)
+        self.last_wrench = np.zeros(4)
         self._sim_time = 0.0
+        self._step_wind = np.zeros(3)
+        self._rotor_efficiencies = np.ones(4)
+        self._ground_effect_multiplier = 1.0
 
-    def reset(self, position: NDArray | None = None, attitude: NDArray | None = None) -> None:
-        """Reset state to rest at origin with identity orientation.
-
-        ``attitude`` (if given) is interpreted as Euler [roll, pitch, yaw] and
-        converted to a quaternion — preserving the legacy call signature.
-        """
-        self.state = np.zeros(self.STATE_SIZE)
-        self.state[6] = 1.0  # identity quaternion
-        self.motor_states = np.zeros(4)
+    def reset(
+        self,
+        position: NDArray | None = None,
+        attitude: NDArray | None = None,
+        *,
+        state: VehicleState | None = None,
+    ) -> None:
+        """Reset the plant, actuators, clock, and disturbance episode state."""
+        if state is not None and (position is not None or attitude is not None):
+            raise ValueError("provide either state or position/attitude, not both")
+        if state is None:
+            self.state = np.zeros(self.STATE_SIZE)
+            self.state[6] = 1.0
+            if position is not None:
+                value = np.asarray(position, dtype=float)
+                if value.shape != (3,):
+                    raise ValueError("position must have shape (3,)")
+                self.state[:3] = value
+            if attitude is not None:
+                value = np.asarray(attitude, dtype=float)
+                if value.shape != (3,):
+                    raise ValueError("attitude must have shape (3,)")
+                self.state[6:10] = quat_from_euler(*value)
+            self.motor_states = np.zeros(4)
+        else:
+            self.state = state.as_vector()
+            self.motor_states = state.motor_speeds.copy()
         self._sim_time = 0.0
-        if position is not None:
-            self.state[:3] = position
-        if attitude is not None:
-            # Backward-compatible: caller passes Euler angles.
-            self.state[6:10] = quat_from_euler(attitude[0], attitude[1], attitude[2])
-        for d in self.disturbances:
-            d.reset()
-            # Give disturbances a chance to restore any modified parameters
-            d.modify_dynamics(self, 0.0)
+        self.last_acceleration.fill(0.0)
+        self.last_angular_acceleration.fill(0.0)
+        self.last_wrench.fill(0.0)
+        for disturbance in self.disturbances:
+            disturbance.reset()
+            disturbance.modify_dynamics(self, 0.0)
+        self._prepare_environment(0.0, 0.0)
 
-    # -- state accessors ---------------------------------------------------
+    # -- state accessors -------------------------------------------------
+
+    def get_state(self) -> VehicleState:
+        return VehicleState.from_vector(
+            self.state, motor_speeds=self.motor_states, time=self._sim_time
+        )
 
     def get_position(self) -> NDArray:
         return self.state[:3].copy()
@@ -114,129 +141,177 @@ class QuadcopterDynamics:
         return self.state[3:6].copy()
 
     def get_attitude(self) -> NDArray:
-        """Euler angles [roll, pitch, yaw] derived from the internal quaternion.
-
-        Backward-compatible with the previous 12-state plant so controllers and
-        examples that consume Euler angles continue to work unmodified.
-        """
         return quat_to_euler(self.state[6:10])
 
     def get_quaternion(self) -> NDArray:
-        """Unit quaternion [w, x, y, z] (body→world)."""
         return self.state[6:10].copy()
 
     def get_angular_velocity(self) -> NDArray:
         return self.state[10:13].copy()
 
-    # -- dynamics ----------------------------------------------------------
-
-    def rotation_matrix(self) -> NDArray:
-        """World←body rotation matrix from the internal quaternion."""
-        return quat_to_rotation_matrix(self.state[6:10])
-
-    def _derivatives(self, state: NDArray, motor_speeds: NDArray, *, t: float | None = None, dt: float = 0.01) -> NDArray:
-        """Compute the 13-state derivative for a given state and motor speeds.
-
-        Quaternion kinematics are integrated as
-
-            q_dot = 0.5 * q ⊗ [0, omega]
-
-        which preserves attitude information through arbitrary rotations
-        (no gimbal-lock singularity).  Renormalisation happens once per
-        ``update()`` step (see ``update``).
-
-        When *t* is provided and disturbances are active, their external
-        force/torque contributions are summed into the total wrench.
-        """
-        T = self.k_f * np.sum(motor_speeds**2)
-        tau_phi = self.k_f * self.arm_length * (motor_speeds[1] ** 2 - motor_speeds[3] ** 2)
-        tau_theta = self.k_f * self.arm_length * (motor_speeds[2] ** 2 - motor_speeds[0] ** 2)
-        tau_psi = self.k_m * (
-            motor_speeds[0] ** 2 - motor_speeds[1] ** 2
-            + motor_speeds[2] ** 2 - motor_speeds[3] ** 2
-        )
-        torques = np.array([tau_phi, tau_theta, tau_psi])
-
-        vel = state[3:6]
-        quat = state[6:10]
-        omega = state[10:13]
-
-        R = quat_to_rotation_matrix(quat)
-        F_thrust = R @ np.array([0.0, 0.0, T])
-        F_drag = -self.k_d * vel
-        F_gravity = np.array([0.0, 0.0, -self.mass * self.g])
-
-        total_force = F_thrust + F_drag + F_gravity
-        total_torque = torques
-
-        # --- disturbance contributions -----------------------------------
-        if t is not None and self.disturbances:
-            for d in self.disturbances:
-                total_force += d.external_force(t, dt, state)
-                total_torque += d.external_torque(t, dt, state)
-
-        accel = total_force / self.mass
-        angular_accel = np.linalg.solve(self.I, total_torque - np.cross(omega, self.I @ omega))
-        quat_dot = quat_derivative(quat, omega)
-
-        deriv = np.zeros(self.STATE_SIZE)
-        deriv[:3] = vel
-        deriv[3:6] = accel
-        deriv[6:10] = quat_dot
-        deriv[10:13] = angular_accel
-        return deriv
-
     def get_motor_speeds(self) -> NDArray:
-        """Return actual motor speeds (after lag filter if enabled)."""
         return self.motor_states.copy()
 
+    def rotation_matrix(self) -> NDArray:
+        return quat_to_rotation_matrix(self.state[6:10])
+
+    def specific_force_body(self) -> NDArray:
+        """Ideal accelerometer specific force at the current state [m/s²]."""
+        gravity_up = np.array([0.0, 0.0, self.g])
+        return self.rotation_matrix().T @ (self.last_acceleration + gravity_up)
+
+    # -- forces and integration -----------------------------------------
+
+    @property
+    def _linear_drag(self) -> NDArray:
+        value = np.asarray(self.k_d, dtype=float)
+        return np.full(3, float(value)) if value.ndim == 0 else value
+
+    def _prepare_environment(self, t: float, dt: float) -> None:
+        self._step_wind = np.zeros(3)
+        self._rotor_efficiencies = np.ones(4)
+        self._ground_effect_multiplier = 1.0
+        for disturbance in self.disturbances:
+            advance = getattr(disturbance, "advance", None)
+            if advance is not None:
+                advance(t, dt, self.state)
+            wind_velocity = getattr(disturbance, "wind_velocity", None)
+            if wind_velocity is not None:
+                self._step_wind += np.asarray(wind_velocity(t), dtype=float)
+            rotor_efficiencies = getattr(disturbance, "rotor_efficiencies", None)
+            if rotor_efficiencies is not None:
+                self._rotor_efficiencies *= np.asarray(
+                    rotor_efficiencies(t), dtype=float
+                )
+            thrust_multiplier = getattr(disturbance, "thrust_multiplier", None)
+            if thrust_multiplier is not None:
+                self._ground_effect_multiplier *= float(
+                    thrust_multiplier(self.state[2])
+                )
+
+    def _wrench(self, motor_speeds: NDArray) -> NDArray:
+        allocation = self.allocation_matrix(self._rotor_efficiencies)
+        wrench = allocation @ np.square(motor_speeds)
+        wrench[0] *= self._ground_effect_multiplier
+        return wrench
+
+    def _derivatives(
+        self,
+        state: NDArray,
+        motor_speeds: NDArray,
+        *,
+        t: float | None = None,
+        dt: float = 0.01,
+    ) -> NDArray:
+        wrench = self._wrench(motor_speeds)
+        thrust = wrench[0]
+        torque = wrench[1:4]
+        velocity = state[3:6]
+        quaternion = state[6:10]
+        body_rates = state[10:13]
+        rotation = quat_to_rotation_matrix(quaternion)
+
+        air_velocity_body = rotation.T @ (velocity - self._step_wind)
+        drag_body = (
+            -self._linear_drag * air_velocity_body
+            - self.config.quadratic_drag
+            * np.abs(air_velocity_body)
+            * air_velocity_body
+        )
+        thrust_world = rotation @ np.array([0.0, 0.0, thrust])
+        drag_world = rotation @ drag_body
+        gravity_world = np.array([0.0, 0.0, -self.mass * self.g])
+        total_force = thrust_world + drag_world + gravity_world
+        total_torque = torque.copy()
+
+        eval_time = self._sim_time if t is None else t
+        for disturbance in self.disturbances:
+            # Wind disturbances are already represented by relative airspeed.
+            if not hasattr(disturbance, "wind_velocity"):
+                total_force += disturbance.external_force(eval_time, dt, state)
+            total_torque += disturbance.external_torque(eval_time, dt, state)
+
+        acceleration = total_force / self.mass
+        angular_acceleration = np.linalg.solve(
+            self.I,
+            total_torque - np.cross(body_rates, self.I @ body_rates),
+        )
+        derivative = np.zeros(self.STATE_SIZE)
+        derivative[:3] = velocity
+        derivative[3:6] = acceleration
+        derivative[6:10] = quat_derivative(quaternion, body_rates)
+        derivative[10:13] = angular_acceleration
+        return derivative
+
     def update(self, dt: float, motor_speeds: NDArray) -> NDArray:
-        """Advance one time-step given 4 commanded motor speeds (rad/s) using RK4.
+        """Advance one fixed step with RK4 and an exact motor-lag update."""
+        if not np.isfinite(dt) or dt <= 0.0:
+            raise ValueError("dt must be a finite positive number")
+        commands = np.asarray(motor_speeds, dtype=float)
+        if commands.shape != (4,) or not np.all(np.isfinite(commands)):
+            raise ValueError("motor_speeds must be a finite shape-(4,) vector")
+        commands = np.clip(commands, self.min_motor_speed, self.max_motor_speed)
 
-        When motor_time_constant > 0 the actual rotor speeds follow a first-order
-        lag:  tau_m * d(omega)/dt + omega = omega_cmd.
-
-        The quaternion part of the state is renormalised after the RK4 step to
-        counter numerical drift (quaternions slowly lose unit norm under
-        fixed-step RK4, which would otherwise corrupt the rotation matrix).
-        """
-        motor_cmds = np.maximum(motor_speeds, 0.0)
-
-        # --- motor lag integration (discrete first-order filter) ----------
         if self.motor_time_constant > 0.0:
-            alpha = dt / self.motor_time_constant
-            self.motor_states += alpha * (motor_cmds - self.motor_states)
-            self.motor_states = np.maximum(self.motor_states, 0.0)
-            actual_motors = self.motor_states
+            alpha = 1.0 - np.exp(-dt / self.motor_time_constant)
+            self.motor_states += alpha * (commands - self.motor_states)
         else:
-            self.motor_states = motor_cmds
-            actual_motors = motor_cmds
+            self.motor_states = commands.copy()
+        self.motor_states = np.clip(
+            self.motor_states, self.min_motor_speed, self.max_motor_speed
+        )
 
-        # --- apply disturbance parameter modifications --------------------
-        for d in self.disturbances:
-            d.modify_dynamics(self, self._sim_time)
+        for disturbance in self.disturbances:
+            disturbance.modify_dynamics(self, self._sim_time)
+        self._prepare_environment(self._sim_time, dt)
 
-        # --- RK4 plant integration ----------------------------------------
         t0 = self._sim_time
-        k1 = self._derivatives(self.state, actual_motors, t=t0, dt=dt)
-        k2 = self._derivatives(self.state + 0.5 * dt * k1, actual_motors, t=t0 + 0.5 * dt, dt=dt)
-        k3 = self._derivatives(self.state + 0.5 * dt * k2, actual_motors, t=t0 + 0.5 * dt, dt=dt)
-        k4 = self._derivatives(self.state + dt * k3, actual_motors, t=t0 + dt, dt=dt)
-
-        self.state += (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
-        self._sim_time += dt
-        # Renormalise quaternion to suppress RK4 norm drift.
+        motors = self.motor_states
+        k1 = self._derivatives(self.state, motors, t=t0, dt=dt)
+        k2 = self._derivatives(
+            self.state + 0.5 * dt * k1, motors, t=t0 + 0.5 * dt, dt=dt
+        )
+        k3 = self._derivatives(
+            self.state + 0.5 * dt * k2, motors, t=t0 + 0.5 * dt, dt=dt
+        )
+        k4 = self._derivatives(self.state + dt * k3, motors, t=t0 + dt, dt=dt)
+        self.state += dt / 6.0 * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
         self.state[6:10] = quat_normalize(self.state[6:10])
+        self._sim_time += dt
+
+        final_derivative = self._derivatives(
+            self.state, motors, t=self._sim_time, dt=dt
+        )
+        self.last_acceleration = final_derivative[3:6].copy()
+        self.last_angular_acceleration = final_derivative[10:13].copy()
+        wrench = self._wrench(motors)
+        self.last_wrench = wrench.copy()
+        if not np.all(np.isfinite(self.state)):
+            raise FloatingPointError(
+                f"quadcopter state became non-finite at t={self._sim_time:.6f}s"
+            )
         return self.state.copy()
 
-    # -- motor allocation helpers ------------------------------------------
+    # -- actuator model --------------------------------------------------
 
-    def allocation_matrix(self) -> NDArray:
-        """Return the 4x4 matrix A mapping [w1^2, w2^2, w3^2, w4^2] to [T, tau_phi, tau_theta, tau_psi]."""
-        kf, km, L = self.k_f, self.k_m, self.arm_length
-        return np.array([
-            [kf, kf, kf, kf],
-            [0, kf * L, 0, -kf * L],
-            [-kf * L, 0, kf * L, 0],
-            [km, -km, km, -km],
-        ])
+    def allocation_matrix(
+        self, efficiencies: NDArray | None = None
+    ) -> NDArray:
+        """Map squared motor speeds to collective thrust and body torque."""
+        positions = self.config.rotor_positions
+        efficiency = (
+            np.ones(4)
+            if efficiencies is None
+            else np.asarray(efficiencies, dtype=float)
+        )
+        if efficiency.shape != (4,):
+            raise ValueError("efficiencies must have shape (4,)")
+        force_gain = self.k_f * efficiency
+        return np.vstack(
+            [
+                force_gain,
+                positions[:, 1] * force_gain,
+                -positions[:, 0] * force_gain,
+                self.config.rotor_directions * self.k_m * efficiency,
+            ]
+        )

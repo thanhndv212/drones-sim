@@ -73,7 +73,12 @@ class GPSSimulator:
         seed: int | None = None,
     ) -> None:
         self.config = config or GPSConfig()
+        self._seed = seed
         self._rng = np.random.default_rng(seed)
+
+    def reset(self, seed: int | None = None) -> None:
+        """Reset the receiver's local random stream for a new episode."""
+        self._rng = np.random.default_rng(self._seed if seed is None else seed)
 
     def simulate(self, traj: TrajectoryData) -> GPSData:
         """Generate GPS measurements from a full ground-truth trajectory.

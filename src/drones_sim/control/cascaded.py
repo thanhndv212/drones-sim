@@ -9,6 +9,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from ..dynamics.quadcopter import QuadcopterDynamics
+from .allocation import ControlAllocator
 from .pid import PIDController
 
 
@@ -195,14 +196,9 @@ class QuadcopterController:
 
         desired_wrench = np.array([thrust, torques[0], torques[1], torques[2]])
 
-        try:
-            allocation = self.quad.allocation_matrix()
-            w_sq = np.linalg.solve(allocation, desired_wrench)
-        except np.linalg.LinAlgError:
-            hover_w = np.sqrt(
-                self.quad.mass * self.quad.g / (4 * self.quad.k_f)
-            )
-            return np.full(4, hover_w)
-
-        motor_speeds = np.sqrt(np.maximum(w_sq, 0.0))
-        return np.clip(motor_speeds, 0.0, self.max_motor_speed)
+        allocator = ControlAllocator(
+            self.quad.allocation_matrix(),
+            min_speed=self.quad.min_motor_speed,
+            max_speed=min(self.max_motor_speed, self.quad.max_motor_speed),
+        )
+        return allocator.allocate(desired_wrench).motor_speeds

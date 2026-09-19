@@ -11,7 +11,11 @@ import argparse
 
 import numpy as np
 
-from drones_sim.rl.actions import ThrustBodyRatesAction, VelocityLevelAction, LQRResidualAction
+from drones_sim.rl.actions import (
+    LQRResidualAction,
+    ThrustBodyRatesAction,
+    VelocityLevelAction,
+)
 from drones_sim.rl.env import QuadcopterEnv
 from drones_sim.rl.observations import RelativeStateObs
 from drones_sim.rl.reward import RewardConfig, reward

@@ -31,15 +31,17 @@ class SensorNoiseModel:
     scale_factor_range: tuple[float, float] = (1.0, 1.0)
     bias_time_constant: float = float('inf')   # tau_b  [s]; inf = constant bias
     bias_random_walk_std: float = 0.0          # sigma_b [units/s^0.5]
+    rng: np.random.Generator | None = field(default=None, repr=False)
 
     # Populated on init
     bias: NDArray = field(init=False)
     scale_factor: NDArray = field(init=False)
 
     def __post_init__(self):
-        self.bias = np.random.uniform(-self.bias_range, self.bias_range, 3)
+        random = self.rng if self.rng is not None else np.random
+        self.bias = random.uniform(-self.bias_range, self.bias_range, 3)
         lo, hi = self.scale_factor_range
-        self.scale_factor = np.random.uniform(lo, hi, 3)
+        self.scale_factor = random.uniform(lo, hi, 3)
 
     def apply(
         self,
@@ -62,13 +64,15 @@ class SensorNoiseModel:
             decay = np.exp(-dt / self.bias_time_constant)
             if self.bias_random_walk_std > 0.0:
                 noise_amp = self.bias_random_walk_std * np.sqrt(1.0 - decay ** 2)
-                drive = np.random.normal(0.0, noise_amp, 3)
+                random = self.rng if self.rng is not None else np.random
+                drive = random.normal(0.0, noise_amp, 3)
             else:
                 drive = np.zeros(3)
             self.bias = decay * self.bias + drive
 
         noisy = true_value * self.scale_factor + self.bias
-        noisy += np.random.normal(0, self.noise_std * temp_factor, 3)
+        random = self.rng if self.rng is not None else np.random
+        noisy += random.normal(0, self.noise_std * temp_factor, 3)
         return noisy
 
 
@@ -77,6 +81,7 @@ class TemperatureModel:
     """Sinusoidal temperature profile with per-axis sensitivity coefficients."""
     base_temp: float = 25.0
     amplitude: float = 10.0
+    rng: np.random.Generator | None = field(default=None, repr=False)
 
     # Per-axis temperature coefficients (populated randomly)
     accel_coef: NDArray = field(init=False)
@@ -84,11 +89,14 @@ class TemperatureModel:
     mag_coef: NDArray = field(init=False)
 
     def __post_init__(self):
-        self.accel_coef = np.random.uniform(-0.002, 0.002, 3)
-        self.gyro_coef = np.random.uniform(-0.0005, 0.0005, 3)
-        self.mag_coef = np.random.uniform(-0.05, 0.05, 3)
+        random = self.rng if self.rng is not None else np.random
+        self.accel_coef = random.uniform(-0.002, 0.002, 3)
+        self.gyro_coef = random.uniform(-0.0005, 0.0005, 3)
+        self.mag_coef = random.uniform(-0.05, 0.05, 3)
 
     def temperature_at(self, t: float, duration: float) -> float:
+        if duration <= 0.0:
+            return self.base_temp
         return self.base_temp + self.amplitude * np.sin(2 * np.pi * t / duration)
 
     def noise_scale(self, temp: float) -> float:

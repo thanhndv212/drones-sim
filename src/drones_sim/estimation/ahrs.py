@@ -55,7 +55,7 @@ class AHRS:
 
         R = quat_to_rotation_matrix(self.quaternion)
 
-        expected_gravity = -R.T @ self._normalize(self.gravity)
+        expected_gravity = R.T @ self._normalize(self.gravity)
         expected_mag = R.T @ self._normalize(self.mag_ref)
 
         accel_error = np.cross(accel_norm, expected_gravity)

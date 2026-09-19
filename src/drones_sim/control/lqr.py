@@ -15,6 +15,7 @@ from numpy.typing import NDArray
 from scipy.linalg import solve_continuous_are
 
 from ..dynamics.quadcopter import QuadcopterDynamics
+from .allocation import ControlAllocator
 
 
 class LQRController:
@@ -139,7 +140,6 @@ class LQRController:
         """
         m  = self.quad.mass
         g  = self.quad.g
-        kf = self.quad.k_f
 
         pos   = self.quad.get_position()
         vel   = self.quad.get_velocity()
@@ -166,13 +166,9 @@ class LQRController:
 
         wrench = np.array([T, torques[0], torques[1], torques[2]])
 
-        # Invert allocation matrix -> squared motor speeds
-        A_alloc = self.quad.allocation_matrix()
-        try:
-            omega_sq = np.linalg.solve(A_alloc, wrench)
-        except np.linalg.LinAlgError:
-            hover_w = float(np.sqrt(m * g / (4.0 * kf)))
-            return np.full(4, hover_w)
-
-        motor_speeds = np.sqrt(np.maximum(omega_sq, 0.0))
-        return np.clip(motor_speeds, 0.0, 4000.0)
+        allocator = ControlAllocator(
+            self.quad.allocation_matrix(),
+            min_speed=self.quad.min_motor_speed,
+            max_speed=self.quad.max_motor_speed,
+        )
+        return allocator.allocate(wrench).motor_speeds

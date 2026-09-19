@@ -12,6 +12,7 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy.spatial.transform import Rotation as R
 
+from ..state import VehicleState
 from ..trajectory import TrajectoryData
 from .models import SensorNoiseModel, TemperatureModel
 
@@ -53,6 +54,16 @@ class IMUData:
     mag_bias: NDArray = field(default_factory=lambda: np.zeros(3))
 
 
+@dataclass
+class IMUMeasurement:
+    """One timestamped 9-axis IMU measurement."""
+
+    acceleration: NDArray
+    angular_velocity: NDArray
+    magnetic_field: NDArray
+    temperature: float | None = None
+
+
 class IMUSimulator:
     """Simulate 9-axis IMU readings from a known trajectory.
 
@@ -64,27 +75,73 @@ class IMUSimulator:
     """
 
     def __init__(self, config: IMUConfig | None = None, seed: int | None = 42):
-        if seed is not None:
-            np.random.seed(seed)
-
         self.cfg = config or IMUConfig()
+        self._seed = seed
+        seed_sequence = np.random.SeedSequence(seed)
+        accel_rng, gyro_rng, mag_rng, temp_rng = [
+            np.random.default_rng(child) for child in seed_sequence.spawn(4)
+        ]
 
         self.accel_model = SensorNoiseModel(
             noise_std=self.cfg.accel_noise_std,
             bias_range=self.cfg.accel_bias_range,
             scale_factor_range=self.cfg.accel_scale,
+            rng=accel_rng,
         )
         self.gyro_model = SensorNoiseModel(
             noise_std=self.cfg.gyro_noise_std,
             bias_range=self.cfg.gyro_bias_range,
             scale_factor_range=self.cfg.gyro_scale,
+            rng=gyro_rng,
         )
         self.mag_model = SensorNoiseModel(
             noise_std=self.cfg.mag_noise_std,
             bias_range=self.cfg.mag_bias_range,
             scale_factor_range=self.cfg.mag_scale,
+            rng=mag_rng,
         )
-        self.temp_model = TemperatureModel() if self.cfg.enable_temperature else None
+        self.temp_model = (
+            TemperatureModel(rng=temp_rng) if self.cfg.enable_temperature else None
+        )
+
+    def reset(self, seed: int | None = None) -> None:
+        """Reset biases and local random streams for a new episode."""
+        self.__init__(self.cfg, self._seed if seed is None else seed)
+
+    def step(
+        self,
+        state: VehicleState,
+        linear_acceleration_world: NDArray,
+        dt: float,
+        *,
+        duration: float = 1.0,
+    ) -> IMUMeasurement:
+        """Generate one measurement from a physical vehicle state.
+
+        The accelerometer convention is specific force
+        ``R.T @ (linear_acceleration + gravity_up)``.
+        """
+        acceleration = np.asarray(linear_acceleration_world, dtype=float)
+        if acceleration.shape != (3,):
+            raise ValueError("linear_acceleration_world must have shape (3,)")
+        rotation = state.rotation_matrix
+        true_accel = rotation.T @ (acceleration + self.cfg.gravity)
+        true_gyro = state.body_rates
+        true_mag = rotation.T @ self.cfg.mag_field_ref
+        temp_factor = 1.0
+        temperature = None
+        if self.temp_model is not None:
+            temperature = self.temp_model.temperature_at(state.time, duration)
+            temp_factor = self.temp_model.noise_scale(temperature)
+            true_accel = true_accel + self.temp_model.accel_offset(temperature)
+            true_gyro = true_gyro + self.temp_model.gyro_offset(temperature)
+            true_mag = true_mag + self.temp_model.mag_offset(temperature)
+        return IMUMeasurement(
+            acceleration=self.accel_model.apply(true_accel, temp_factor, dt),
+            angular_velocity=self.gyro_model.apply(true_gyro, temp_factor, dt),
+            magnetic_field=self.mag_model.apply(true_mag, temp_factor, dt),
+            temperature=temperature,
+        )
 
     def simulate(self, traj: TrajectoryData) -> IMUData:
         """Generate sensor readings from a trajectory."""
@@ -104,7 +161,7 @@ class IMUSimulator:
 
             # --- Accelerometer: gravity in body + linear accel reaction ---
             gravity_body = rot.T @ self.cfg.gravity
-            lin_accel_body = rot.T @ (-traj.acceleration[i])
+            lin_accel_body = rot.T @ traj.acceleration[i]
             true_accel = gravity_body + lin_accel_body
 
             # --- Gyroscope: angular velocity in body frame ---

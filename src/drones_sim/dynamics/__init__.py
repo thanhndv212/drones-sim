@@ -1,3 +1,4 @@
+from .config import QuadcopterConfig
 from .disturbances import (  # noqa: F401
     ConstantWind,
     Disturbance,
@@ -7,4 +8,6 @@ from .disturbances import (  # noqa: F401
     PayloadDrop,
     StepWind,
 )
-from .quadcopter import QuadcopterDynamics  # noqa: F401
+from .quadcopter import QuadcopterDynamics
+
+__all__ = ["QuadcopterConfig", "QuadcopterDynamics"]

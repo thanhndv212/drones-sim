@@ -10,6 +10,8 @@ from __future__ import annotations
 import numpy as np
 from numpy.typing import NDArray
 
+from ..control.allocation import ControlAllocator
+
 
 class MotorSpeedAction:
     """Lowest level: raw motor speeds for each of 4 rotors.
@@ -70,15 +72,10 @@ class ThrustBodyRatesAction:
             tau[2] * 0.02,
         ])
 
-        alloc = quad.allocation_matrix()
-        try:
-            w_sq = np.linalg.solve(alloc, wrench)
-        except np.linalg.LinAlgError:
-            hover_w = np.sqrt(hover_thrust / (4 * quad.k_f))
-            return np.full(4, hover_w)
-
-        motor_speeds = np.sqrt(np.maximum(w_sq, 0.0))
-        return np.clip(motor_speeds, 0.0, 4000.0)
+        allocator = ControlAllocator(
+            quad.allocation_matrix(), quad.min_motor_speed, quad.max_motor_speed
+        )
+        return allocator.allocate(wrench).motor_speeds
 
 
 class LQRResidualAction:
@@ -216,12 +213,7 @@ class VelocityLevelAction:
 
         # ── 5. wrench → motor speeds ──
         wrench = np.array([total_thrust, tau_phi, tau_theta, tau_psi])
-        alloc = quad.allocation_matrix()
-        try:
-            w_sq = np.linalg.solve(alloc, wrench)
-        except np.linalg.LinAlgError:
-            hover_w = np.sqrt(hover / (4 * quad.k_f))
-            return np.full(4, hover_w)
-
-        motor_speeds = np.sqrt(np.maximum(w_sq, 0.0))
-        return np.clip(motor_speeds, 0.0, 4000.0)
+        allocator = ControlAllocator(
+            quad.allocation_matrix(), quad.min_motor_speed, quad.max_motor_speed
+        )
+        return allocator.allocate(wrench).motor_speeds
