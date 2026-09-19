@@ -1,24 +1,34 @@
 [build-system]
-requires = ["setuptools>=68.0", "wheel"]
+requires = ["setuptools>=77.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "drones-sim"
-version = "0.1.0"
-description = "Quadcopter dynamics simulation with cascaded PID control and EKF sensor fusion"
-license = {text = "MIT"}
+version = "0.2.0"
+description = "Composable quadcopter modeling, control, estimation, and visualization"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.24",
     "scipy>=1.10",
     "matplotlib>=3.7",
-    "viser>=0.2",
+    "rerun-sdk>=0.27,<1",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "ruff"]
+viser = ["viser>=0.2"]
 rl  = ["torch>=2.2", "stable-baselines3>=2.3", "gymnasium>=0.29", "tensorboard>=2.15", "pyyaml>=6.0"]
 rl-dev = ["drones-sim[rl]", "wandb", "optuna>=3.5", "moviepy"]
+
+[project.urls]
+Homepage = "https://github.com/thanhndv212/drones-sim"
+Documentation = "https://github.com/thanhndv212/drones-sim#readme"
+Changelog = "https://github.com/thanhndv212/drones-sim/blob/master/CHANGELOG.md"
+Issues = "https://github.com/thanhndv212/drones-sim/issues"
+Source = "https://github.com/thanhndv212/drones-sim"
 
 [tool.setuptools.packages.find]
 where = ["src"]

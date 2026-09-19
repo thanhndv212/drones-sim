@@ -52,3 +52,6 @@ MANIFEST
 training/checkpoints/
 configs/
 tb/
+models/
+wandb/
+.codegraph/
