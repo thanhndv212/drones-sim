@@ -2,6 +2,7 @@
 
 from .simulation import ClosedLoopSimulator, SimulationConfig, SimulationResult
 from .state import ControlOutput, TrajectorySetpoint, VehicleState
+from .visualization import visualize
 
 __all__ = [
     "ClosedLoopSimulator",
@@ -10,4 +11,5 @@ __all__ = [
     "SimulationResult",
     "TrajectorySetpoint",
     "VehicleState",
+    "visualize",
 ]

@@ -239,6 +239,22 @@ class DroneViewer:
     # Playback with time slider
     # ------------------------------------------------------------------
 
+    def playback_result(self, result, *, urdf_model=None) -> None:
+        """Play a :class:`~drones_sim.simulation.SimulationResult` directly."""
+        from ..math_utils import quat_to_rotation_matrix
+
+        rotations = np.array(
+            [quat_to_rotation_matrix(value) for value in result.quaternion]
+        )
+        self.playback(
+            result.time,
+            result.position,
+            rotations,
+            filtered_positions=result.estimated_position,
+            reference_positions=result.reference_position,
+            urdf_model=urdf_model,
+        )
+
     def playback(
         self,
         t: NDArray,
