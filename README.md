@@ -5,6 +5,7 @@ Composable quadcopter simulation for control and state-estimation experiments. I
 [![CI](https://github.com/thanhndv212/drones-sim/actions/workflows/ci.yml/badge.svg)](https://github.com/thanhndv212/drones-sim/actions/workflows/ci.yml)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/thanhndv212/drones-sim)
 
+![Rerun synchronized flight playback](drones-sim-rerun.gif)
 ## Install
 
 ```bash
